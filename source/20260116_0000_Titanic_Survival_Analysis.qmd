@@ -32,7 +32,7 @@ update_geom_defaults("point", list(alpha = 0.8))
 # Data loading and preparation
 
 ```{r}
-train <- read_csv("data/train.csv", show_col_types = FALSE)
+train <- read_csv("../data/train.csv", show_col_types = FALSE)
 # Basic cleaning and feature engineering
 
 titanic <- train %>%
