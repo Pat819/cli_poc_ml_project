@@ -1,0 +1,176 @@
+---
+title: Titanic Survival Analysis - Gender, SES, and Mediators
+author: "CLI Copilot"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    self-contained: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+library(tidyverse)
+library(broom)
+library(knitr)
+library(forcats)
+library(janitor)
+
+train <- read_csv("../data/train.csv", show_col_types = FALSE) %>%
+  janitor::clean_names()
+# Basic cleaning: create age groups and family size
+train <- train %>%
+  mutate(
+    sex = factor(sex),
+    pclass = factor(pclass, levels = c(1,2,3), labels = c("1st","2nd","3rd")),
+    embarked = factor(embarked),
+    age_group = case_when(
+      is.na(age) ~ "Unknown",
+      age < 5 ~ "Infant",
+      age < 13 ~ "Child",
+      age < 18 ~ "Teen",
+      age < 30 ~ "YoungAdult",
+      age < 50 ~ "Adult",
+      TRUE ~ "Senior"
+    ),
+    age_group = factor(age_group, levels = c("Infant","Child","Teen","YoungAdult","Adult","Senior","Unknown")),
+    family_size = sib_sp + parch + 1,
+    family_structure = case_when(
+      family_size == 1 ~ "Solo",
+      sib_sp > 0 & parch == 0 ~ "Siblings/Spouse",
+      sib_sp == 0 & parch > 0 ~ "Parents/Children",
+      sib_sp > 0 & parch > 0 ~ "Extended",
+      TRUE ~ "Other"
+    ) %>% factor()
+  )
+```
+
+## EDA
+
+```{r}
+# Structure and missingness
+skim_summary <- tibble(
+  n = nrow(train),
+  missing_age = sum(is.na(train$age)),
+  missing_embarked = sum(is.na(train$embarked)),
+  missing_cabin = sum(is.na(train$cabin))
+)
+skim_summary
+
+train %>% count(sex, pclass, survived) %>%
+  mutate(prop = n/sum(n)) %>% arrange(desc(prop)) %>% kable()
+
+train %>% ggplot(aes(x = age, fill = factor(survived))) +
+  geom_histogram(binwidth = 5, position = "identity", alpha = 0.6) +
+  labs(fill = "Survived", title = "Age distribution by survival")
+
+train %>% ggplot(aes(x = pclass, fill = factor(survived))) +
+  geom_bar(position = "fill") +
+  labs(y = "Proportion", fill = "Survived", title = "Survival proportion by class")
+
+train %>% ggplot(aes(x = sex, fill = factor(survived))) +
+  geom_bar(position = "fill") +
+  labs(y = "Proportion", fill = "Survived", title = "Survival proportion by sex")
+```
+
+## Modeling: Survival ~ Gender + SES with mediators
+
+We fit logistic regressions to quantify joint effects of gender and SES, and assess mediation by age, family structure, and port of embarkation.
+
+```{r}
+# Use a consistent complete-case dataset for model comparisons
+mod_data <- train %>% drop_na(survived, sex, pclass, age_group, family_structure, embarked)
+
+# Baseline: sex + pclass + interaction
+m1 <- glm(survived ~ sex * pclass, data = mod_data, family = binomial())
+# Add age group
+m2 <- glm(survived ~ sex * pclass + age_group, data = mod_data, family = binomial())
+# Add family structure
+m3 <- glm(survived ~ sex * pclass + age_group + family_structure, data = mod_data, family = binomial())
+# Add port of embarkation
+m4 <- glm(survived ~ sex * pclass + age_group + family_structure + embarked, data = mod_data, family = binomial())
+
+models <- list(m1 = m1, m2 = m2, m3 = m3, m4 = m4)
+
+bind_rows(lapply(names(models), function(nm) {
+  broom::tidy(models[[nm]]) %>% mutate(model = nm)
+})) %>%
+  filter(term %in% c("sexmale","pclass2nd","pclass3rd","sexmale:pclass2nd","sexmale:pclass3rd")) %>%
+  mutate(or = exp(estimate)) %>%
+  select(model, term, estimate, std.error, p.value, or) %>%
+  arrange(model, term) %>% kable(digits = 3, caption = "Key coefficients: gender, SES, and interactions")
+
+# Likelihood comparison to assess incremental contribution of mediators
+anova(m1, m2, test = "Chisq")
+anova(m2, m3, test = "Chisq")
+anova(m3, m4, test = "Chisq")
+```
+
+### Predicted probabilities across gender and SES
+
+```{r}
+newdata <- expand_grid(
+  sex = factor(c("female","male"), levels = levels(train$sex)),
+  pclass = factor(c("1st","2nd","3rd"), levels = levels(train$pclass)),
+  age_group = factor(c("Infant","Child","Teen","YoungAdult","Adult","Senior","Unknown"), levels = levels(train$age_group)),
+  family_structure = factor(levels(train$family_structure), levels = levels(train$family_structure)),
+  embarked = factor(levels(train$embarked), levels = levels(train$embarked))
+) %>%
+  # Use most common categories for mediators for presentation
+  group_by(sex, pclass) %>%
+  mutate(
+    age_group = fct_explicit_na(age_group, na_level = "Unknown"),
+    family_structure = fct_lump_prop(family_structure, prop = 0.05),
+    embarked = fct_lump_prop(embarked, prop = 0.05)
+  ) %>%
+  slice(1) %>% ungroup()
+
+newdata$pred_m4 <- predict(m4, newdata = newdata, type = "response")
+
+newdata %>% ggplot(aes(x = pclass, y = pred_m4, color = sex, group = sex)) +
+  geom_point(size = 3) + geom_line() +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(title = "Predicted survival by gender and class (holding mediators typical)", y = "Predicted survival", x = "Class")
+```
+
+## Age group risk
+
+Identify which age group has the lowest predicted survival probability.
+
+```{r}
+# Fit a model focusing on age group effects controlling for sex and class
+mage <- glm(survived ~ sex + pclass + age_group, data = train, family = binomial())
+agd <- expand_grid(
+  sex = factor(c("female","male"), levels = levels(train$sex)),
+  pclass = factor(c("1st","2nd","3rd"), levels = levels(train$pclass)),
+  age_group = levels(train$age_group)
+) %>% mutate(age_group = factor(age_group, levels = levels(train$age_group)))
+agd$pred <- predict(mage, newdata = agd, type = "response")
+
+age_summary <- agd %>% group_by(age_group) %>% summarise(mean_pred = mean(pred)) %>% arrange(mean_pred)
+age_summary %>% kable(digits = 3, caption = "Average predicted survival by age group (adjusted for sex and class)")
+
+worst_age <- age_summary %>% slice(1)
+worst_age
+```
+
+## Findings and interpretation
+
+- Joint effect: Across all models, males and lower classes (2nd, 3rd) exhibit substantially lower survival odds. Interaction terms typically indicate that being male in 3rd class is at the highest risk.
+- Mediation: Stepwise model comparisons using likelihood ratio tests show whether age group, family structure, and embarkation add explanatory power. Significant reductions in deviance indicate partial mediation pathways.
+- Age group risk: The table above identifies the age group with the lowest adjusted survival probability.
+
+## Recommendation to improve Titanic safety
+
+Based on the analysis, prioritize policies that increase survival for the highest-risk groups:
+
+- Reinforce evacuation priority and access to lifeboats for males in lower classes, especially in 3rd class.
+- Improve lifeboat capacity and equitable distribution across decks to reduce class-based bottlenecks.
+- Provide targeted assistance for the worst-performing age group (from the analysis output), ensuring clear signage, crew guidance, and muster drills tailored to that group.
+- Standardize embarkation and muster procedures across ports to minimize variability; ensure consistent safety briefings regardless of embarkation port.
