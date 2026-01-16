@@ -52,7 +52,7 @@ titanic <- train %>%
     # Age handling: create age groups with an Unknown bucket
     AgeGroup = case_when(
       is.na(Age) ~ "Unknown",
-      Age < 12 ~ "Child";
+      Age < 12 ~ "Child",
       Age >= 12 & Age < 18 ~ "Teen",
       Age >= 18 & Age < 30 ~ "YoungAdult",
       Age >= 30 & Age < 50 ~ "Adult",
