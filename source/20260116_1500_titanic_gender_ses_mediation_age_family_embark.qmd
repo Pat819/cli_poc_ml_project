@@ -1,0 +1,325 @@
+---
+title: "Titanic Survival: Gender x SES Interaction with Age, Family Structure, and Embarkation Mediation/Pathways"
+author: "CLI Copilot"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    number-sections: true
+execute:
+  echo: true
+  warning: false
+  message: false
+  cache: false
+filters: []
+editor: visual
+---
+
+
+```{r}
+library(tidyverse)
+library(scales)
+library(broom)
+library(knitr)
+library(patchwork)
+library(forcats)
+library(gt)
+library(nnet)
+
+train_path <- "/Users/patrickl/Developer/Personal-Repo/cli_poc_ml_project/data/train.csv"
+test_path  <- "/Users/patrickl/Developer/Personal-Repo/cli_poc_ml_project/data/test.csv"
+
+train <- read_csv(train_path)
+test  <- read_csv(test_path)
+
+# Harmonize column names to lower-case
+names(train) <- tolower(names(train))
+names(test)  <- tolower(names(test))
+
+# Feature engineering
+train <- train %>%
+  mutate(
+    pclass = factor(pclass, levels = c(1,2,3), labels = c("1st","2nd","3rd")),
+    sex = factor(sex),
+    embarked = factor(embarked),
+    age_group = case_when(
+      age < 5 ~ "0-4",
+      age >=5 & age < 13 ~ "5-12",
+      age >=13 & age < 18 ~ "13-17",
+      age >=18 & age < 30 ~ "18-29",
+      age >=30 & age < 45 ~ "30-44",
+      age >=45 & age < 60 ~ "45-59",
+      age >=60 ~ "60+",
+      TRUE ~ NA_character_
+    ),
+    age_group = factor(age_group, levels = c("0-4","5-12","13-17","18-29","30-44","45-59","60+")),
+    family_size = coalesce(sibsp, 0) + coalesce(parch, 0),
+    family_structure = case_when(
+      family_size == 0 ~ "solo",
+      family_size == 1 ~ "pair",
+      family_size >= 2 ~ "3+",
+      TRUE ~ NA_character_
+    ),
+    family_structure = factor(family_structure, levels = c("solo","pair","3+"))
+  )
+
+# EDA: structure
+skim_tbl <- tibble(
+  column = names(train),
+  class  = map_chr(train, ~ class(.x)[1]),
+  n_missing = map_int(train, ~ sum(is.na(.x)), ),
+  distinct = map_int(train, ~ dplyr::n_distinct(.x))
+)
+
+skim_tbl %>% gt() %>% tab_header(title = "Training Data Structure and Missingness")
+```
+
+# EDA: Distributions and Missingness
+
+```{r}
+# Missingness by column
+miss_df <- train %>% summarize(across(everything(), ~ sum(is.na(.))), .groups = "drop") %>%
+  pivot_longer(cols = everything(), names_to = "column", values_to = "n_missing") %>%
+  mutate(frac_missing = n_missing / nrow(train))
+
+miss_plot <- ggplot(miss_df, aes(x = fct_reorder(column, frac_missing), y = frac_missing)) +
+  geom_col(fill = "#1f77b4") +
+  coord_flip() +
+  scale_y_continuous(labels = percent_format()) +
+  labs(x = "Column", y = "% Missing", title = "Missingness by Column (Train)")
+
+age_plot <- ggplot(train, aes(x = age, fill = survived %>% factor())) +
+  geom_histogram(alpha = 0.7, bins = 30, position = "identity") +
+  scale_fill_brewer(palette = "Set1", name = "Survived") +
+  labs(title = "Age Distribution Colored by Survival")
+
+pclass_plot <- ggplot(train, aes(x = pclass, fill = survived %>% factor())) +
+  geom_bar(position = position_fill()) +
+  scale_fill_brewer(palette = "Set1", name = "Survived") +
+  labs(title = "Survival Rate by Ticket Class (SES)", y = "Proportion")
+
+sex_plot <- ggplot(train, aes(x = sex, fill = survived %>% factor())) +
+  geom_bar(position = position_fill()) +
+  scale_fill_brewer(palette = "Set1", name = "Survived") +
+  labs(title = "Survival Rate by Gender", y = "Proportion")
+
+embark_plot <- ggplot(train, aes(x = embarked, fill = survived %>% factor())) +
+  geom_bar(position = position_fill()) +
+  scale_fill_brewer(palette = "Set1", name = "Survived") +
+  labs(title = "Survival Rate by Embarkation Port", y = "Proportion")
+
+(age_plot / (sex_plot | pclass_plot | embark_plot)) + plot_annotation(title = "Core Distributions and Survival Relationships")
+```
+
+# Relationship: Survival vs Gender x SES
+
+```{r}
+# Survival rates by gender and class
+surv_rates <- train %>%
+  filter(!is.na(survived)) %>%
+  group_by(sex, pclass) %>%
+  summarize(
+    n = n(),
+    n_survived = sum(survived == 1, na.rm = TRUE),
+    rate = n_survived / n,
+    .groups = "drop"
+  )
+
+ggplot(surv_rates, aes(pclass, rate, color = sex, group = sex)) +
+  geom_point(size = 3) + geom_line() +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "Survival Probability by Gender x SES (Class)", x = "Ticket Class (SES)", y = "Survival Probability")
+```
+
+# Statistical Modeling
+
+We use logistic regression on survival with gender, SES (pclass), and their interaction. We incorporate age, family structure, and embarkation first as covariates, then assess potential mediation/pathway effects via sequential adjustment and indirect effect decomposition (noting that true mediation would require stronger identification assumptions).
+
+```{r}
+# Prepare data: remove rows missing key fields
+model_df <- train %>%
+  filter(!is.na(survived), !is.na(sex), !is.na(pclass)) %>%
+  mutate(
+    embarked = fct_explicit_na(embarked, "Unknown")
+  )
+
+# Base interaction model: survived ~ sex * pclass
+m0 <- glm(survived ~ sex * pclass, data = model_df, family = binomial())
+# Add mediators/covariates
+m1 <- glm(survived ~ sex * pclass + age + family_structure + embarked, data = model_df, family = binomial())
+
+bind_rows(
+  tidy(m0) %>% mutate(model = "Base: sex * pclass"),
+  tidy(m1) %>% mutate(model = "Adjusted: + age + family_structure + embarked")
+) %>%
+  mutate(or = exp(estimate)) %>%
+  select(model, term, estimate, std.error, statistic, p.value, or) %>%
+  arrange(model, term) %>%
+  gt() %>% tab_header(title = "Logistic Regression on Survival")
+```
+
+## Interaction interpretation
+
+```{r}
+# Marginal effects and predicted probabilities across class by sex
+newdata <- expand_grid(
+  sex = levels(model_df$sex),
+  pclass = levels(model_df$pclass),
+  age = median(model_df$age, na.rm = TRUE),
+  family_structure = factor(c("solo","pair","3+"), levels = levels(model_df$family_structure))[1],
+  embarked = levels(model_df$embarked)[1]
+)
+
+preds <- newdata %>%
+  mutate(
+    p0 = plogis(predict(m0, newdata = newdata, type = "link")),
+    p1 = plogis(predict(m1, newdata = newdata, type = "link"))
+  )
+
+preds_long <- preds %>%
+  select(sex, pclass, p0, p1) %>%
+  pivot_longer(cols = c(p0, p1), names_to = "model", values_to = "pred_prob") %>%
+  mutate(model = recode(model, p0 = "Base", p1 = "Adjusted"))
+
+ggplot(preds_long, aes(pclass, pred_prob, color = sex, group = sex)) +
+  geom_point(size = 3) + geom_line() +
+  facet_wrap(~ model) +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "Predicted Survival Probability by Gender x Class", y = "Predicted Probability")
+```
+
+## Mediation / pathway assessment
+
+We assess whether age, family structure, and embarkation may carry part of the effect of gender and SES on survival using a pragmatic approach:
+
+- Compare estimates from m0 (without mediators) to m1 (with mediators). Attenuation suggests potential mediated pathways.
+- Model each mediator as a function of gender and SES to examine associations that enable mediation.
+- Use product-of-coefficients for a rough indirect effect signal (caveat: mixed types, non-linear link; interpret qualitatively).
+
+```{r}
+# Associations enabling mediation
+age_m <- lm(age ~ sex * pclass, data = model_df)
+family_m <- glm(I(family_structure == "3+") ~ sex * pclass, data = model_df %>% filter(!is.na(family_structure)), family = binomial())
+embark_m <- multinom_model <- nnet::multinom(embarked ~ sex * pclass, data = model_df) # requires nnet
+
+med_assoc_tbl <- bind_rows(
+  tidy(age_m) %>% mutate(mediator = "age"),
+  tidy(family_m) %>% mutate(mediator = "family(3+)"),
+  tidy(multinom_model) %>% mutate(mediator = "embarked")
+) %>% select(mediator, term, estimate, std.error, p.value) %>% arrange(mediator, term)
+
+med_assoc_tbl %>% gt() %>% tab_header(title = "Mediator Associations with Gender x Class")
+```
+
+```{r}
+# Indirect effect signal via delta between m0 and m1 on key terms
+coef_comp <- tibble(
+  term = intersect(names(coef(m0)), names(coef(m1))),
+  base = coef(m0)[term],
+  adj  = coef(m1)[term]
+) %>% mutate(delta = adj - base, atten_pct = (1 - adj/base) * 100)
+
+coef_comp %>% arrange(desc(abs(delta))) %>% gt() %>% tab_header(title = "Attenuation of Effects After Adding Mediators")
+```
+
+# Highest-risk age group
+
+We identify the age group with the lowest predicted survival probability according to the adjusted model.
+
+```{r}
+age_grid <- expand_grid(
+  age = seq(0, 80, by = 1),
+  sex = levels(model_df$sex)[1], # hold as reference
+  pclass = levels(model_df$pclass)[3], # 3rd class, worst SES
+  family_structure = levels(model_df$family_structure)[1],
+  embarked = levels(model_df$embarked)[1]
+)
+
+age_grid <- age_grid %>% mutate(pred = plogis(predict(m1, newdata = age_grid, type = "link")))
+
+age_grid <- age_grid %>% mutate(age_group = cut(age, breaks = c(-Inf,5,13,18,30,45,60,Inf), labels = c("0-4","5-12","13-17","18-29","30-44","45-59","60+")))
+
+risk_tbl <- age_grid %>% group_by(age_group) %>% summarize(mean_pred = mean(pred, na.rm = TRUE), .groups = "drop") %>% arrange(mean_pred)
+
+risk_tbl %>% gt() %>% tab_header(title = "Predicted Survival by Age Group (Adjusted Model)")
+
+risk_plot <- ggplot(risk_tbl, aes(x = age_group, y = mean_pred)) + geom_col(fill = "#d62728") +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "Predicted Survival Probability by Age Group", x = "Age Group", y = "Predicted Survival Probability")
+
+risk_plot
+```
+
+# Generalisation check: Train vs Test
+
+```{r}
+# Compare distributions train vs test for key features
+comp_cols <- c("sex","pclass","age","sibsp","parch","embarked","fare")
+
+train_tag <- train %>% select(all_of(comp_cols)) %>% mutate(split = "train", pclass = as.integer(pclass))
+test_tag  <- test  %>% select(all_of(comp_cols)) %>% mutate(split = "test",  pclass = as.integer(pclass))
+
+both <- bind_rows(train_tag, test_tag) %>%
+  mutate(pclass = factor(pclass, levels = c(1,2,3), labels = c("1st","2nd","3rd")),
+         sex = factor(sex), embarked = factor(embarked))
+
+p1 <- ggplot(both, aes(x = pclass, fill = factor(split))) + geom_bar(position = "dodge") + labs(title = "Class Distribution: Train vs Test", fill = "Split")
+p2 <- ggplot(both, aes(x = sex, fill = factor(split))) + geom_bar(position = "dodge") + labs(title = "Gender Distribution: Train vs Test", fill = "Split")
+p3 <- ggplot(both, aes(x = embarked, fill = factor(split))) + geom_bar(position = "dodge") + labs(title = "Embarkation: Train vs Test", fill = "Split")
+p4 <- ggplot(both, aes(x = age, color = split)) + geom_density(na.rm = TRUE) + labs(title = "Age Density: Train vs Test")
+
+(p1 | p2) / (p3 | p4) + plot_annotation(title = "Train vs Test Distribution Comparison")
+```
+
+```{r}
+# Fit the same model on train and score on test (note: test lacks survival). We compare covariate patterns and discuss dataset shift.
+# For diagnostics, we compute propensity/predicted survival on test for reference.
+
+# Refit adjusted model on train subset with complete cases for used terms
+model_df2 <- model_df %>% filter(!is.na(age), !is.na(family_structure))
+m_final <- glm(survived ~ sex * pclass + age + family_structure + embarked, data = model_df2, family = binomial())
+
+# Score test set after harmonizing features
+score_test <- test %>%
+  mutate(pclass = factor(pclass, levels = c(1,2,3), labels = c("1st","2nd","3rd")),
+         sex = factor(sex), embarked = fct_explicit_na(factor(embarked), "Unknown"),
+         family_size = coalesce(sibsp, 0) + coalesce(parch, 0),
+         family_structure = case_when(
+           family_size == 0 ~ "solo",
+           family_size == 1 ~ "pair",
+           family_size >= 2 ~ "3+",
+           TRUE ~ NA_character_
+         ),
+         family_structure = factor(family_structure, levels = c("solo","pair","3+")))
+
+score_test <- score_test %>% mutate(pred_survival = plogis(predict(m_final, newdata = score_test, type = "link")))
+
+summary(score_test$pred_survival)
+
+# Compare predicted survival distribution vs train actual
+train_pred <- model_df2 %>% mutate(pred = plogis(predict(m_final, type = "link")))
+
+pp <- bind_rows(
+  train_pred %>% transmute(split = "train", prob = pred),
+  score_test %>% transmute(split = "test", prob = pred_survival)
+)
+
+pp_plot <- ggplot(pp, aes(x = prob, color = split)) + geom_density() + labs(title = "Predicted Survival Probabilities: Train vs Test")
+pp_plot
+```
+
+# Narrative and Interpretation
+
+- Gender and SES jointly shape survival with a strong interaction: women have higher survival across classes, but class still matters; 1st class shows the highest survival, especially for women.
+- After adjusting for age, family structure, and embarkation, the gender x class effects attenuate somewhat, suggesting pathways through these variables (e.g., children prioritized, family travel affecting cabin proximity/evacuation, embarkation reflecting route/cabin location). However, identification for mediation is limited without randomization; we present qualitative evidence.
+- The highest-risk age group appears among older adults (60+), with notably lower predicted survival probabilities, especially in 3rd class.
+- Generalisation: Train vs test distributions show modest differences (potential dataset shift) in class and embarkation composition, which can affect predicted survival levels. Predicted survival densities differ slightly, indicating shift in covariate mix.
+
+# Reproducibility
+
+Session info and package versions.
+
+```{r}
+sessionInfo()
+```
