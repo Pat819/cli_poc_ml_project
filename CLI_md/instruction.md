@@ -46,7 +46,9 @@ execute:
 
 #### Sections
 
-- In each section, clearl document the logic and reasoning behind your steps. Why did you decide to go with this code chunch and how did it help answer the research question?
+- In each section, the should be a text chuck for each code chunk that clearly document the logic and reasoning behind your steps. 
+- Why did you decide to go with this code chunck?
+- How did it help answer the research question?
 - Also, comment your code to explain what each part does inline.
 
 #### ggplot desing
@@ -74,18 +76,14 @@ Example pattern:
 ## Workflow expectation: iterative report development (3 cycles)
 
 ### Goal
-Produce a high-quality, reproducible report by iterating through a write → render → review → improve loop three times, versioning progress with Git each cycle.
+Produce a high-quality, reproducible report by iterating through a write → render → review → improve loop two times, versioning progress with Git each cycle.
 
 ---
 
 ## Iteration loop (repeat 3 times)
 
-### 1) Draft / revise the source
-- Update the report source file(s) to improve:
-  - structure and clarity
-  - analysis depth and correctness
-  - visuals, tables, and narrative flow
-  - explicit answers to the guiding questions/objectives
+### 1) Create a new git branh and start with a .qmd file
+- Start a qmd file with proposed scripts that would help to address the research questions
 
 ### 2) Render the output
 - Render the report to the target format (e.g., HTML).
@@ -93,26 +91,21 @@ Produce a high-quality, reproducible report by iterating through a write → ren
 - If the render fails, fix issues and re-render until it succeeds.
 
 ### 3) Review the rendered output
-- Read the latest rendered output (not just the source).
+- Read the latest rendered .htmk output (not just the source).
+- Focus on the generated graphics, tables and use these information to address the research questions
 - Check for:
   - completeness relative to the objectives
   - correctness of results and interpretation
   - clarity, readability, and narrative coherence
   - presentation quality (figures, labels, headings, TOC)
   - reproducibility (consistent results, no brittle steps)
-
-### 4) Identify improvements
-- Write down the top gaps or weaknesses visible in the rendered output.
-- Make targeted improvements in the source to address them.
+- Propose additional analyses, visualizations, or refinements needed.
+- Make all new discovery and necessary adjustments to the .qmd file.
 
 ### 5) Version control (end of each iteration)
 - Stage changes for both source and rendered output (as required).
 - Commit with an iteration-tagged message (e.g., `iter1: ...`, `iter2: ...`, `iter3: ...`).
 - Push commits to the working branch.
 
----
-
-## Completion criteria (after iteration 3)
-- The rendered report fully addresses the objectives with clear, well-supported conclusions.
-- The project builds cleanly with zero errors.
-- The Git history shows three iteration commits, each reflecting meaningful improvement.
+### 6) Create a pull request (after final iteration)
+- After completing the third iteration, create a pull request to merge changes into `main` using gh pr create (provide title/body in the command or via flags).
