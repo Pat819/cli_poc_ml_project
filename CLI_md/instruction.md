@@ -17,10 +17,7 @@
 ## 2) Work location and tooling constraints
 
 - Work inside: `@source/`
-- Use **R**, with a strong emphasis on:
-  - **tidyverse**
-  - **ggplot2**
-- You may install additional R packages if needed.
+
 
 ---
 
@@ -58,6 +55,9 @@ execute:
 - Ensure all plots have clear titles, axis labels, and legends
 - legends position should always be bottom
 
+
+#### Tables design
+- Use `knitr::kable()` for better formatting
 ---
 
 ## 4) File naming
@@ -71,28 +71,48 @@ Example pattern:
 - and the corresponding `.html`
 
 ---
+## Workflow expectation: iterative report development (3 cycles)
 
-## 5) Render workflow and correctness
-
-- Write the `.qmd` in `@source/`
-- Render to `.html`
-- If rendering fails:
-  - fix the `.qmd`
-  - re-render until it compiles with zero errors
-- After rendering succeeds:
-  - read the rendered HTML output
-  - write a clear analysis + conclusion that answers the research questions
-- If needed:
-  - revise the `.qmd`
-  - re-render the final HTML
+### Goal
+Produce a high-quality, reproducible report by iterating through a write → render → review → improve loop three times, versioning progress with Git each cycle.
 
 ---
 
-## 6) Git delivery
+## Iteration loop (repeat 3 times)
 
-After the final HTML is successfully produced:
-- Create a new branch (descriptive name)
-- Commit the `.qmd` and `.html` outputs
-- Push/publish the branch
-- Create a PR via CLI (without opening the browser):
-  - Use `gh pr create` (provide title/body in the command or via flags)
+### 1) Draft / revise the source
+- Update the report source file(s) to improve:
+  - structure and clarity
+  - analysis depth and correctness
+  - visuals, tables, and narrative flow
+  - explicit answers to the guiding questions/objectives
+
+### 2) Render the output
+- Render the report to the target format (e.g., HTML).
+- Ensure the build completes with zero errors.
+- If the render fails, fix issues and re-render until it succeeds.
+
+### 3) Review the rendered output
+- Read the latest rendered output (not just the source).
+- Check for:
+  - completeness relative to the objectives
+  - correctness of results and interpretation
+  - clarity, readability, and narrative coherence
+  - presentation quality (figures, labels, headings, TOC)
+  - reproducibility (consistent results, no brittle steps)
+
+### 4) Identify improvements
+- Write down the top gaps or weaknesses visible in the rendered output.
+- Make targeted improvements in the source to address them.
+
+### 5) Version control (end of each iteration)
+- Stage changes for both source and rendered output (as required).
+- Commit with an iteration-tagged message (e.g., `iter1: ...`, `iter2: ...`, `iter3: ...`).
+- Push commits to the working branch.
+
+---
+
+## Completion criteria (after iteration 3)
+- The rendered report fully addresses the objectives with clear, well-supported conclusions.
+- The project builds cleanly with zero errors.
+- The Git history shows three iteration commits, each reflecting meaningful improvement.
