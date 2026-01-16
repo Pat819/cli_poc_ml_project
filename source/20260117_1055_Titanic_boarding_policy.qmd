@@ -1,0 +1,262 @@
+---
+title: "Titanic survival: ticket/cabin context, party structure, gender×age, and at-boarding policy drivers"
+author: "CLI Copilot"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    self-contained: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Setup
+
+```{r}
+# Helper: install packages if missing
+pkgs <- c(
+  "tidyverse", "janitor", "broom", "viridis", "mgcv", "ranger", "knitr", "pROC"
+)
+inst <- pkgs[!pkgs %in% rownames(installed.packages())]
+if (length(inst) > 0) install.packages(inst, repos = "https://cloud.r-project.org")
+
+library(tidyverse)
+library(janitor)
+library(broom)
+library(viridis)
+library(mgcv)
+library(ranger)
+library(knitr)
+
+# ggplot design: minimalist theme, viridis palette, bottom legend
+theme_set(theme_minimal(base_size = 12))
+update_geom_defaults("point", list(size = 2, alpha = 0.8))
+update_geom_defaults("line", list(size = 0.9))
+
+# Paths
+train_path <- file.path("..", "data", "train.csv")
+
+# Utility: read CSV
+read_train <- function() {
+  read_csv(train_path, show_col_types = FALSE) |> clean_names()
+}
+
+# Utility: factor ordering
+ordered_deck <- function(x) {
+  lvls <- c("A","B","C","D","E","F","G","T","Unknown")
+  x <- fct_na_value_to_level(x, level = "Unknown")
+  fct_other(x, keep = lvls) |> fct_relevel(lvls)
+}
+```
+
+# Data and feature engineering
+
+Text: We load Titanic training data and engineer variables reflecting ticket/cabin context and travel party structure. We infer group size by ticket (co-travelers sharing a ticket), family size from SibSp and Parch, deck from the first letter of Cabin, and derive additional at-boarding features such as title and ticket prefix.
+
+```{r}
+raw <- read_train()
+
+# Basic cleaning and engineered fields
+
+engineered <- raw |> 
+  mutate(
+    survived_f = factor(if_else(survived == 1, "Yes", "No"), levels = c("No","Yes")),
+    sex = factor(sex),
+    embarked = factor(embarked, levels = c("C","Q","S")),
+    family_size = sib_sp + parch + 1L,
+    ticket_clean = str_squish(ticket),
+    ticket_prefix = str_extract(ticket_clean, "^[A-Za-z\\./]+") |> str_replace_all("[\\n\\./ ]", "") |> na_if("") |> replace_na("None"),
+    cabin_first = str_extract(coalesce(cabin, ""), "^[A-Za-z]") |> na_if("") |> replace_na("Unknown"),
+    deck = ordered_deck(cabin_first),
+    cabin_known = factor(if_else(is.na(cabin) | cabin == "", "No", "Yes"), levels = c("No","Yes")),
+    title = str_extract(name, ",[[:space:]]*([^\\.]+)\\.") |> str_trim() |> 
+      fct_collapse(Mr = c("Mr"), Mrs = c("Mrs"), Miss = c("Miss", "Mlle"), 
+                   Master = c("Master"), Dr = c("Dr"), 
+                   Officer = c("Col","Major","Capt","Rev","Don","Jonkheer"),
+                   Royalty = c("Sir","Lady","the Countess","Dona"),
+                   Other = c("Mme"))
+  ) |> 
+  group_by(ticket_clean) |> 
+  mutate(group_size = n()) |> 
+  ungroup() |> 
+  mutate(
+    # Age imputation for modeling only (kept separate column)
+    age_imp = if_else(is.na(age), 
+                      ave(age, interaction(pclass, sex), FUN = function(x) median(x, na.rm = TRUE))[row_number()],
+                      age),
+    fare_imp = if_else(is.na(fare), median(fare, na.rm = TRUE), fare)
+  )
+
+# Quick overview
+engineered |> 
+  select(survived, pclass, sex, age, age_imp, sib_sp, parch, family_size, group_size, embarked, fare, deck, cabin_known, ticket_prefix, title) |> 
+  head() |> 
+  kable()
+```
+
+# Q1. Ticket/cabin context and travel party structure → survival, with mediators
+
+Text: We test how ticket/cabin context (Pclass, cabin_known, deck) and party structure (family_size, group_size) relate to survival. We examine whether deck, group size, and embarkation act as mediators by comparing sequential logistic models and inspecting coefficient attenuation when mediators are added.
+
+```{r}
+# Model A: baseline (ticket/cabin + party structure without mediators)
+modA <- glm(survived_f ~ pclass + sex + family_size + group_size + pclass:group_size + cabin_known,
+            data = engineered, family = binomial)
+
+# Model B: add potential mediators (deck, embarked)
+modB <- glm(survived_f ~ pclass + sex + family_size + group_size + pclass:group_size + cabin_known + deck + embarked,
+            data = engineered, family = binomial)
+
+# Compare coefficients and fit
+compare_tbl <- bind_rows(
+  tidy(modA) |> mutate(model = "A: baseline"),
+  tidy(modB) |> mutate(model = "B: + mediators")
+) |> mutate(or = exp(estimate), 
+            conf_low = exp(estimate - 1.96*std.error),
+            conf_high = exp(estimate + 1.96*std.error))
+
+kable(compare_tbl, digits = 3)
+
+fit_tbl <- tibble(
+  model = c("A: baseline", "+ mediators"),
+  AIC = c(AIC(modA), AIC(modB)),
+  McFadden_R2 = c(1 - logLik(modA)/logLik(update(modA, . ~ 1)),
+                  1 - logLik(modB)/logLik(update(modB, . ~ 1))) |> as.numeric()
+)
+
+kable(fit_tbl, digits = 3)
+```
+
+## Visualizing joint effects and mediator pathways
+
+Text: We visualize predicted survival across group size and ticket class, and show how predictions shift when mediators are included.
+
+```{r}
+# Create grid for predictions
+newdat <- expand_grid(
+  pclass = 1:3,
+  sex = factor(c("female","male"), levels = c("female","male")),
+  family_size = c(1,2,4),
+  group_size = 1:6,
+  cabin_known = factor(c("No","Yes"), levels = c("No","Yes")),
+  deck = factor(c("Unknown","A","B","C","D","E","F"), levels = levels(engineered$deck)),
+  embarked = factor(c("C","Q","S"), levels = levels(engineered$embarked))
+)
+
+predA <- newdat |> 
+  mutate(prob = plogis(predict(modA, newdat, type = "link")), model = "A: baseline")
+
+predB <- newdat |> 
+  mutate(prob = plogis(predict(modB, newdat, type = "link")), model = "B: + mediators")
+
+preds <- bind_rows(predA, predB)
+
+# Aggregate over mediator levels to compare average effects
+agg <- preds |> 
+  group_by(model, pclass, sex, family_size, group_size, cabin_known) |> 
+  summarize(prob = mean(prob), .groups = "drop")
+
+agg |> 
+  ggplot(aes(group_size, prob, color = factor(pclass), linetype = cabin_known)) +
+  geom_line() +
+  facet_grid(sex ~ family_size, labeller = label_both) +
+  scale_color_viridis(discrete = TRUE, end = 0.85, option = "D") +
+  labs(title = "Predicted survival across group size by ticket class and cabin assignment",
+       x = "Group size (ticket co-travelers)", y = "Predicted survival probability",
+       color = "Pclass", linetype = "Cabin known?" ) +
+  theme(legend.position = "bottom")
+```
+
+# Q2. Gender × age (nonlinear): "women and children first" profile
+
+Text: We fit a GAM with smooths of age by gender to capture nonlinear survival-age profiles and test whether the gender gap varies across the lifespan.
+
+```{r}
+# Use complete cases on age for GAM; small N so we keep it simple
+cc <- engineered |> filter(!is.na(age)) |> mutate(survived_bin = as.integer(survived_f == "Yes"))
+
+m_gam <- gam(survived_bin ~ sex + s(age, by = sex, k = 6) + pclass,
+             data = cc, family = binomial(link = "logit"), method = "REML")
+
+# Prediction grid for smooths
+new_age <- expand_grid(
+  age = seq(0, 80, by = 1),
+  sex = factor(c("female","male"), levels = c("female","male")),
+  pclass = 2 # hold typical class fixed for visualization
+)
+
+pred_gam <- predict(m_gam, newdata = new_age, type = "link", se.fit = TRUE)
+new_age <- new_age |> 
+  mutate(
+    fit = pred_gam$fit,
+    se = pred_gam$se.fit,
+    prob = plogis(fit),
+    lo = plogis(fit - 1.96*se),
+    hi = plogis(fit + 1.96*se)
+  )
+
+new_age |> 
+  ggplot(aes(age, prob, color = sex, fill = sex)) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.15, color = NA) +
+  geom_line() +
+  scale_color_viridis(discrete = TRUE, end = 0.8) +
+  scale_fill_viridis(discrete = TRUE, end = 0.8) +
+  labs(title = "Nonlinear gender × age survival profile (GAM)",
+       x = "Age", y = "Predicted survival probability", color = "Sex", fill = "Sex") +
+  theme(legend.position = "bottom")
+
+# Brief significance summary
+kable(tidy(m_gam), digits = 3)
+```
+
+# Q3. At-boarding predictive features and operational policy
+
+Text: We restrict to information plausibly known at or before boarding (exclude cabin deck specifics if uncertain). We train a fast random forest (ranger) and examine feature importance, then translate top predictors into operational safety guidance.
+
+```{r}
+# Features known pre-boarding: pclass, sex, age (or est.), sib_sp, parch, fare, embarked, ticket_prefix, group_size, family_size, title
+model_df <- engineered |> 
+  mutate(survived_bin = as.integer(survived_f == "Yes")) |> 
+  select(survived_bin, pclass, sex, age_imp, sib_sp, parch, fare_imp, embarked, ticket_prefix, group_size, family_size, title)
+
+set.seed(123)
+idx <- sample.int(nrow(model_df), floor(0.75 * nrow(model_df)))
+train_df <- model_df[idx,]
+valid_df <- model_df[-idx,]
+
+rf <- ranger(
+  survived_bin ~ ., data = train_df, probability = TRUE,
+  num.trees = 1000, mtry = 4, min.node.size = 5, importance = "impurity"
+)
+
+pred <- predict(rf, data = valid_df)$predictions[,2]
+roc_auc <- pROC::auc(response = valid_df$survived_bin, predictor = pred)
+
+imp <- as_tibble(rf$variable.importance, rownames = "feature") |> 
+  arrange(desc(value)) |> 
+  rename(importance = value)
+
+kable(tibble(Metric = "ROC AUC (holdout)", Value = as.numeric(roc_auc)), digits = 3)
+
+imp |> head(12) |> kable(digits = 3)
+```
+
+## Policy implications (based on drivers)
+
+Text: Based on the most predictive features, we propose actionable pre-incident policies:
+
+- If group_size and family_size strongly predict survival, ensure muster and signage accommodate intact parties; assign crew to guide larger parties from lower classes.
+- If sex and age dominate, reinforce “women and children first” drills with targeted crew allocation at congested embarkation points (Embarked S vs C/Q differences may proxy crowding/route).
+- If pclass and fare (SES proxies) drive disparity, implement cross-deck access controls and equitable lifeboat allocation drills.
+- Use ticket_prefix/group_size to pre-map parties to adjacent muster stations; flag unusually large tickets for extra assistance.
+
+We recommend validating these policies with regular drills and monitoring throughput bottlenecks by embarkation port.
+
+# Appendix: session info
+
+```{r}
+sessionInfo()
+```
