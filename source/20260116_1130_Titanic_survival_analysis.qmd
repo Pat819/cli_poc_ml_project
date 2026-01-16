@@ -1,0 +1,148 @@
+---
+title: "Titanic survival analysis: gender, SES, and mediators"
+author: "CLI Copilot"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    self-contained: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Setup
+
+Text: We load tidyverse and read the Kaggle Titanic training data. We will create helper variables for SES (pclass), age groups, and family structure, and ensure factors have informative labels. We will use descriptive plots and logistic regression to address mediation questions.
+
+```{r}
+library(tidyverse)
+train <- read_csv("../data/train.csv", show_col_types = FALSE)
+
+# Clean and engineer features
+train <- train %>%
+  mutate(
+    survived = factor(Survived, levels = c(0,1), labels = c("No","Yes")),
+    sex = factor(Sex, levels = c("male","female"), labels = c("Male","Female")),
+    ses = factor(Pclass, levels = c(1,2,3), labels = c("Upper","Middle","Lower")),
+    embarked = factor(Embarked, levels = c("C","Q","S"), labels = c("Cherbourg","Queenstown","Southampton")),
+    age_group = case_when(
+      is.na(Age) ~ NA_character_,
+      Age < 12 ~ "Child (<12)",
+      Age < 18 ~ "Teen (12-17)",
+      Age < 30 ~ "Young Adult (18-29)",
+      Age < 50 ~ "Adult (30-49)",
+      TRUE ~ "Older (50+)"
+    ),
+    age_group = factor(age_group, levels = c("Child (<12)","Teen (12-17)","Young Adult (18-29)","Adult (30-49)","Older (50+)")),
+    family_size = SibSp + Parch + 1,
+    family_structure = case_when(
+      family_size == 1 ~ "Solo",
+      family_size <= 3 ~ "Small (2-3)",
+      TRUE ~ "Large (4+)"
+    ),
+    family_structure = factor(family_structure, levels = c("Solo","Small (2-3)","Large (4+)"))
+  )
+```
+
+# 1) How do gender and SES jointly shape survival, and is that relationship mediated by age, family structure, port of embarkation?
+
+Text: We start with descriptive survival rates across gender and SES, then fit nested logistic regression models: (a) gender + SES, (b) add mediators (age group, family structure, embarked). Changes in coefficients for gender/SES will indicate whether mediators account for part of the association.
+
+```{r}
+# Descriptive survival by gender and SES
+surv_tbl <- train %>%
+  group_by(sex, ses) %>%
+  summarize(survival_rate = mean(Survived, na.rm = TRUE), n = n(), .groups = "drop")
+surv_tbl %>% arrange(sex, ses) %>% knitr::kable(digits = 3, caption = "Survival rate by gender and SES")
+
+# Plot
+ggplot(train, aes(ses, as.numeric(survived)-1, fill = sex)) +
+  stat_summary(fun = mean, geom = "bar", position = position_dodge(width = 0.8)) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Survival probability by SES and gender", x = "Socioeconomic status (pclass)", y = "Survival probability", fill = "Gender") +
+  theme_minimal() + theme(legend.position = "bottom")
+```
+
+```{r}
+# Logistic regression models
+# Base: gender + SES
+m1 <- glm(Survived ~ sex + ses, data = train, family = binomial())
+# Add mediators: age group, family structure, embarked
+m2 <- glm(Survived ~ sex + ses + age_group + family_structure + embarked, data = train, family = binomial())
+
+broom::tidy(m1, exponentiate = TRUE, conf.int = TRUE) %>%
+  select(term, estimate, conf.low, conf.high, p.value) %>%
+  knitr::kable(digits = 3, caption = "Odds ratios (m1): gender + SES")
+
+broom::tidy(m2, exponentiate = TRUE, conf.int = TRUE) %>%
+  select(term, estimate, conf.low, conf.high, p.value) %>%
+  knitr::kable(digits = 3, caption = "Odds ratios (m2): + mediators")
+
+# Compare coefficient changes
+coef_compare <- broom::tidy(m1, exponentiate = TRUE) %>%
+  select(term, or_m1 = estimate) %>%
+  inner_join(broom::tidy(m2, exponentiate = TRUE) %>% select(term, or_m2 = estimate), by = "term")
+coef_compare %>% knitr::kable(digits = 3, caption = "OR comparison between m1 and m2")
+```
+
+Text: Interpretation guidance
+- If female OR remains large after adding mediators, gender has a direct association with survival beyond age, family structure, and embarkation.
+- SES (pclass) OR reduction after mediators suggests part of SES effect is due to age composition, family traveling patterns, or port differences.
+
+# 2) Which age group is at the highest risk?
+
+Text: We compute survival by age group and visualize. We also extract logistic model marginal predictions for age groups to confirm.
+
+```{r}
+# Survival by age group
+age_surv <- train %>%
+  filter(!is.na(age_group)) %>%
+  group_by(age_group) %>%
+  summarize(survival_rate = mean(Survived), n = n(), .groups = "drop")
+age_surv %>% arrange(match(age_group, levels(train$age_group))) %>% knitr::kable(digits = 3, caption = "Survival rate by age group")
+
+# Plot
+ggplot(filter(train, !is.na(age_group)), aes(age_group, as.numeric(survived)-1)) +
+  stat_summary(fun = mean, geom = "bar", fill = scales::brewer_pal(palette = "Set2")(3)[1]) +
+  labs(title = "Survival probability by age group", x = "Age group", y = "Survival probability") +
+  theme_minimal() + theme(legend.position = "bottom")
+```
+
+```{r}
+# Marginal predictions for age group from m2
+library(marginaleffects)
+preds_age <- predictions(m2, newdata = datagrid(age_group = levels(na.omit(train$age_group)), sex = levels(train$sex)[1], ses = levels(train$ses)[3], family_structure = levels(train$family_structure)[1], embarked = levels(train$embarked)))
+# Note: choosing a reference combination; rank by predicted survival
+preds_age %>% arrange(estimate) %>% knitr::kable(digits = 3, caption = "Predicted survival by age group (reference covariates)")
+```
+
+Text: We identify the age group with the lowest survival probability; this corresponds to highest mortality risk.
+
+# 3) Suggestion to improve Titanic safety
+
+Text: Based on findings that gender and SES strongly associate with survival, and that children and certain adult groups differ, propose procedural safety improvements: standardized evacuation prioritizing children independent of class, equitable lifeboat access from all decks, drills and signage to reduce class-based disparities, and staff training to enforce women-and-children-first without class bias.
+
+```{r}
+# Summarize key findings
+list(
+  gender_effect_m1 = broom::tidy(m1, exponentiate = TRUE) %>% filter(term == "sexFemale") %>% pull(estimate),
+  gender_effect_m2 = broom::tidy(m2, exponentiate = TRUE) %>% filter(term == "sexFemale") %>% pull(estimate),
+  ses_effects_m2 = broom::tidy(m2, exponentiate = TRUE) %>% filter(grepl("ses", term)) %>% select(term, estimate),
+  lowest_age_group = age_surv %>% arrange(survival_rate) %>% slice(1)
+)
+```
+
+Text: Recommendations
+- Institute uniform lifeboat access and muster locations across classes.
+- Pre-assign lifeboat seats prioritizing children first, then caretakers, regardless of ticket class.
+- Conduct multilingual safety drills at embarkation ports to ensure understanding.
+- Increase crew training on evacuation protocols to reduce discretionary bias.
+
+# Session info
+
+```{r}
+sessionInfo()
+```
