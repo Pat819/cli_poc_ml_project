@@ -1,0 +1,266 @@
+---
+title: "Titanic Survival: Joint Effects of Gender and Socioeconomic Status, and Mediation by Age, Family Structure, and Port"
+author: "Automated Report"
+date: "`r format(Sys.time(), '%Y-%m-%d %H:%M:%S')`"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    theme: cosmo
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+knitr::opts_chunk$set(fig.width = 7, fig.height = 5, dpi = 120)
+```
+
+```{r}
+#| label: packages
+# Load required packages (use only base and recommended to avoid missing deps)
+library(stats)
+library(utils)
+library(graphics)
+library(grDevices)
+library(datasets)
+
+# Use simple helper functions
+percent <- function(x) paste0(round(100 * x, 1), "%")
+```
+
+# Data
+
+```{r}
+#| label: load-data
+train_path <- "/Users/patrickl/Developer/Personal-Repo/cli_poc_ml_project/data/train.csv"
+test_path  <- "/Users/patrickl/Developer/Personal-Repo/cli_poc_ml_project/data/test.csv"
+
+train <- read.csv(train_path, stringsAsFactors = FALSE)
+test  <- read.csv(test_path, stringsAsFactors = FALSE)
+
+# Basic checks
+stopifnot(all(c("Survived","Pclass","Sex","Age","SibSp","Parch","Fare","Embarked") %in% names(train)))
+stopifnot(all(c("Pclass","Sex","Age","SibSp","Parch","Fare","Embarked") %in% names(test)))
+```
+
+## Data description
+
+See CLI_md/data_description.md for full details. Key variables:
+- Survived (0/1), outcome in train only
+- Pclass (1,2,3) proxy for SES
+- Sex (male/female)
+- Age (years)
+- SibSp, Parch (family structure)
+- Embarked (C/Q/S)
+
+## Preprocessing
+
+```{r}
+#| label: preprocess
+# Harmonize types
+train$Survived <- as.integer(train$Survived)
+train$Pclass   <- as.factor(train$Pclass)
+test$Pclass    <- as.factor(test$Pclass)
+train$Sex      <- as.factor(train$Sex)
+test$Sex       <- as.factor(test$Sex)
+train$Embarked <- as.factor(train$Embarked)
+test$Embarked  <- as.factor(test$Embarked)
+
+# Family size and structure indicator
+train$FamilySize <- train$SibSp + train$Parch + 1
+test$FamilySize  <- test$SibSp + test$Parch + 1
+train$HasFamily  <- as.factor(ifelse(train$FamilySize > 1, "with_family", "alone"))
+test$HasFamily   <- as.factor(ifelse(test$FamilySize > 1, "with_family", "alone"))
+
+# Age: simple imputation with group medians (by Sex and Pclass) to avoid dropping rows
+impute_age <- function(df) {
+  df$Age_imputed <- df$Age
+  # compute medians by Sex and Pclass, fall back to overall median
+  overall_med <- median(df$Age, na.rm = TRUE)
+  for (sx in levels(df$Sex)) {
+    for (pc in levels(df$Pclass)) {
+      idx <- df$Sex == sx & df$Pclass == pc
+      med <- median(df$Age[idx], na.rm = TRUE)
+      if (is.na(med)) med <- overall_med
+      df$Age_imputed[idx & is.na(df$Age)] <- med
+    }
+  }
+  df
+}
+train <- impute_age(train)
+test  <- impute_age(test)
+
+# Embarked: handle missing by most frequent category
+mode_embarked <- function(x) {
+  tab <- table(x)
+  names(tab)[which.max(tab)]
+}
+if (any(is.na(train$Embarked))) train$Embarked[is.na(train$Embarked)] <- mode_embarked(train$Embarked)
+if (any(is.na(test$Embarked)))  test$Embarked[is.na(test$Embarked)]  <- mode_embarked(test$Embarked)
+
+# Ensure factor levels align between train and test
+test$Embarked <- factor(test$Embarked, levels = levels(train$Embarked))
+```
+
+# Exploratory Data Analysis (EDA)
+
+```{r}
+#| label: eda-overview
+# Dimensions
+cat("Train n =", nrow(train), " Test n =", nrow(test), "\n")
+
+# Outcome rate by gender and class
+xt <- xtabs(~ Sex + Pclass + Survived, data = train)
+print(xt)
+
+# Survival by Sex
+by_sex <- aggregate(Survived ~ Sex, data = train, FUN = function(x) c(rate = mean(x), n = length(x)))
+by_sex
+
+# Survival by Class
+by_class <- aggregate(Survived ~ Pclass, data = train, FUN = function(x) c(rate = mean(x), n = length(x)))
+by_class
+
+# Survival by Embarked
+by_emb <- aggregate(Survived ~ Embarked, data = train, FUN = function(x) c(rate = mean(x), n = length(x)))
+by_emb
+
+# Age summaries
+summary(train$Age)
+summary(train$Age_imputed)
+
+# Family size distribution
+summary(train$FamilySize)
+```
+
+```{r}
+#| label: eda-plots
+# Base R plots for portability
+par(mfrow = c(2,2))
+# Survival rate by Sex
+barplot(tapply(train$Survived, train$Sex, mean, na.rm = TRUE), main = "Survival rate by Sex", ylim = c(0,1), col = c("steelblue","tomato"))
+# Survival rate by Pclass
+barplot(tapply(train$Survived, train$Pclass, mean, na.rm = TRUE), main = "Survival rate by Pclass", ylim = c(0,1), col = "gray")
+# Age density by Survived
+plot(density(train$Age_imputed[train$Survived==0]), main = "Age density by Survival", col = "tomato", lwd = 2)
+lines(density(train$Age_imputed[train$Survived==1]), col = "steelblue", lwd = 2)
+legend("topright", legend = c("Died","Survived"), col = c("tomato","steelblue"), lwd = 2)
+# Family size vs survival
+boxplot(FamilySize ~ Survived, data = train, main = "Family Size vs Survival", col = c("tomato","steelblue"), ylab = "FamilySize")
+par(mfrow = c(1,1))
+```
+
+# Modeling the Research Question
+
+Research question: How do gender and socioeconomic status jointly shape survival, and is that relationship mediated by age, family structure, and port of embarkation?
+
+We model survival using logistic regression with:
+- Main effects: Sex, Pclass
+- Joint effect: Sex:Pclass interaction
+- Potential mediators/covariates: Age_imputed, FamilySize, HasFamily, Embarked
+
+```{r}
+#| label: model-fit
+# Fit logistic regression
+mod <- glm(Survived ~ Sex * Pclass + Age_imputed + FamilySize + HasFamily + Embarked + Fare,
+           data = train, family = binomial())
+summary(mod)
+
+# Odds ratios and 95% CI
+coef_table <- summary(mod)$coefficients
+OR <- exp(coef(mod))
+SE <- coef_table[,"Std. Error"]
+LCI <- exp(coef(mod) - 1.96*SE)
+UCI <- exp(coef(mod) + 1.96*SE)
+res <- data.frame(Term = names(OR), OR = OR, LCI = LCI, UCI = UCI, p = coef_table[,"Pr(>|z|)"])
+res[order(res$p),]
+```
+
+```{r}
+#| label: model-performance
+# In-sample performance (for reference)
+train$pred_prob <- plogis(predict(mod, newdata = train))
+
+# AUC (simple threshold-free measure using Mann-Whitney U equivalence)
+# Implement quick AUC without external packages
+calc_auc <- function(prob, y){
+  o <- order(prob)
+  prob <- prob[o]; y <- y[o]
+  # ranks of probabilities
+  r <- rank(prob)
+  pos <- y == 1
+  n1 <- sum(pos); n0 <- sum(!pos)
+  if (n1 == 0 || n0 == 0) return(NA)
+  auc <- (sum(r[pos]) - n1*(n1+1)/2) / (n1*n0)
+  auc
+}
+train_auc <- calc_auc(train$pred_prob, train$Survived)
+train_auc
+
+# Calibration style summary
+mean_pred <- mean(train$pred_prob)
+obs_rate  <- mean(train$Survived)
+c(mean_pred = mean_pred, observed_rate = obs_rate)
+```
+
+## Generalization to Test Data
+
+The test set does not contain the outcome, so we assess generalization by:
+- Comparing feature distributions between train and test.
+- Applying the trained model to test and reviewing predicted probabilities.
+
+```{r}
+#| label: generalization
+# Compare distributions
+comp <- function(train_vec, test_vec) {
+  c(train_mean = mean(train_vec, na.rm = TRUE),
+    test_mean  = mean(test_vec,  na.rm = TRUE),
+    train_sd   = sd(train_vec,   na.rm = TRUE),
+    test_sd    = sd(test_vec,    na.rm = TRUE))
+}
+
+num_comp <- rbind(
+  Age_imputed = comp(train$Age_imputed, test$Age_imputed),
+  FamilySize  = comp(train$FamilySize,  test$FamilySize),
+  Fare        = comp(train$Fare,        test$Fare)
+)
+num_comp
+
+# Categorical distribution comparisons (proportions)
+prop_tab <- function(x) prop.table(table(x))
+list(
+  Sex = rbind(train = prop_tab(train$Sex), test = prop_tab(test$Sex)),
+  Pclass = rbind(train = prop_tab(train$Pclass), test = prop_tab(test$Pclass)),
+  Embarked = rbind(train = prop_tab(train$Embarked), test = prop_tab(test$Embarked)),
+  HasFamily = rbind(train = prop_tab(train$HasFamily), test = prop_tab(test$HasFamily))
+)
+
+# Predictions on test
+test$pred_prob <- plogis(predict(mod, newdata = test))
+summary(test$pred_prob)
+
+# Simple thresholds for interpretation
+c(
+  pct_pred_gt_0.5 = percent(mean(test$pred_prob > 0.5)),
+  pct_pred_gt_0.7 = percent(mean(test$pred_prob > 0.7)),
+  pct_pred_lt_0.3 = percent(mean(test$pred_prob < 0.3))
+)
+```
+
+## Interpretation
+
+- Gender and SES: The Sex:Pclass interaction tests whether the survival advantage of females varies by class (SES). Significant interaction terms indicate joint shaping of survival.
+- Mediation by age, family structure, and port: Including Age_imputed, FamilySize/HasFamily, and Embarked adjusts the joint effect. If the Sex:Pclass coefficients attenuate after adding these covariates, that suggests partial mediation/confounding.
+- Generalization: Similar feature distributions across train/test and stable predictions suggest the model generalizes reasonably. Without outcomes in test, formal metrics (AUC, calibration) cannot be computed, but distributional comparisons and prediction summaries provide evidence.
+
+## Appendix: Session Info
+
+```{r}
+#| label: session-info
+sessionInfo()
+```
