@@ -14,7 +14,7 @@
 
 ---
 
-## 2) Work location and tooling constraints
+## 2) Work location 
 
 - Work inside: `@source/`
 
