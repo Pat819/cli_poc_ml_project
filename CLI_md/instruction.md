@@ -21,11 +21,7 @@
 
 ---
 
-## 3) Deliverable: Quarto report + rendered HTML
-
-Design and create a detailed **Quarto report** that would answer the user's research question, consider the following coponents if suitable
-
-### QMD expectation
+## 3) QMD expectation
 
 #### Header
 
@@ -73,14 +69,16 @@ Example pattern:
 - and the corresponding `.html`
 
 ---
-## Workflow expectation: iterative report development (3 cycles)
+## Workflow expectation: iterative report development 
 
 ### Goal
-Produce a high-quality, reproducible report by iterating through a write → render → review → improve loop two times, versioning progress with Git each cycle.
+Produce a high-quality, reproducible report by iterating through a write → render → review → improve loop 
+Use R with a strong emphasis on tidyverse and ggplot2.
+You may install additional R packages if needed.
 
 ---
 
-## Iteration loop (repeat 3 times)
+## Iteration loop 
 
 ### 1) Create a new git branh and start with a .qmd file
 - Start a qmd file with proposed scripts that would help to address the research questions
@@ -104,7 +102,7 @@ Produce a high-quality, reproducible report by iterating through a write → ren
 
 ### 5) Version control (end of each iteration)
 - Stage changes for both source and rendered output (as required).
-- Commit with an iteration-tagged message (e.g., `iter1: ...`, `iter2: ...`, `iter3: ...`).
+- Commit with an iteration-tagged message (e.g., `iter1: ...`, `iter2: ...`).
 - Push commits to the working branch.
 
 ### 6) Create a pull request (after final iteration)
