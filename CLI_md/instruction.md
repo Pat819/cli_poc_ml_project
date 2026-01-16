@@ -101,6 +101,8 @@ You may install additional R packages if needed.
 
 ### 4) Make all new discovery and necessary adjustments to the .qmd file.
 - Based on the new information and findings from step 3, conduct further analysis on .qmd to refine and enhance the report.
+- In each section, all another text chunk to report all the main results based on the tables and figures output based on the .html in step 3.
+- How did the new results help answer the research questions?
 
 ### 5) Version control 
 - Stage changes for both source and rendered output (as required).
