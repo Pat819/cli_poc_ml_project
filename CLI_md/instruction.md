@@ -28,7 +28,9 @@
 
 Design and create a detailed **Quarto report** that would answer the user's research question, consider the following coponents if suitable
 
-### Preferred QMD header
+### QMD expectation
+
+#### Header
 
 ---
 title: 
@@ -45,12 +47,16 @@ execute:
   message: false
 ---
 
-### EDA
-- Data structure, missingness, distributions
+#### Sections
 
-### Statistical modeling
+- In each section, clearl document the logic and reasoning behind your steps. Why did you decide to go with this code chunch and how did it help answer the research question?
+- Also, comment your code to explain what each part does inline.
 
-### Generalisation check (train vs test)
+#### ggplot desing
+- go with a consistent minimalist theme
+- Think carefully about color palettes (e.g., viridis, RColorBrewer)
+- Ensure all plots have clear titles, axis labels, and legends
+- legends position should always be bottom
 
 ---
 
