@@ -80,7 +80,7 @@ You may install additional R packages if needed.
 
 ## Iteration loop 
 
-### 1) Create and publish a new git branc and start with a .qmd file
+### 1) Create and publish a new git branch and start with a .qmd file
 - Start a qmd file with proposed scripts that would help to address the research questions
 
 ### 2) Render the output
@@ -89,7 +89,7 @@ You may install additional R packages if needed.
 - If the render fails, fix issues and re-render until it succeeds.
 
 ### 3) Review the rendered output
-- Read the latest rendered .htmk output (not just the source).
+- Read the latest rendered .html output (not just the source).
 - Focus on the generated graphics, tables and use these information to address the research questions
 - Check for:
   - completeness relative to the objectives
@@ -98,12 +98,14 @@ You may install additional R packages if needed.
   - presentation quality (figures, labels, headings, TOC)
   - reproducibility (consistent results, no brittle steps)
 - Propose additional analyses, visualizations, or refinements needed.
-- Make all new discovery and necessary adjustments to the .qmd file.
 
-### 5) Version control (end of each iteration)
+### 4) Make all new discovery and necessary adjustments to the .qmd file.
+- Based on the new information and findings from step 3, conduct further analysis on .qmd to refine and enhance the report.
+
+### 5) Version control 
 - Stage changes for both source and rendered output (as required).
-- Commit with an iteration-tagged message (e.g., `iter1: ...`, `iter2: ...`).
+- Commit with an iteration-tagged message 
 - Push commits to the working branch.
 
-### 6) Create a pull request (after final iteration)
+### 6) **Make Sure** Create a pull request 
 - After completing the third iteration, create a pull request to merge changes into `main` using gh pr create (provide title/body in the command or via flags).
