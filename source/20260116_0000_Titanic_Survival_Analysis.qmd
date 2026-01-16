@@ -1,0 +1,254 @@
+---
+title: "Titanic Survival Analysis: Gender, SES, Age, Family, and Embarkation"
+author: "CLI Copilot"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    self-contained: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+
+```{r}
+# Load libraries
+library(tidyverse)
+library(janitor)
+library(broom)
+library(ggthemes)
+library(scales)
+
+# Minimalist theme setup
+theme_set(theme_minimal(base_size = 12))
+update_geom_defaults("bar", list(fill = "#3B82F6"))
+```
+
+# Introduction
+
+This report analyzes how gender and socioeconomic status (SES; proxied by passenger class) jointly shape survival on the Titanic, and whether that relationship is mediated by age, family structure, and port of embarkation. We also identify the age group at highest risk and conclude with suggestions to improve safety.
+
+We primarily use the Kaggle Titanic train dataset, which contains the target variable Survived. The test dataset is used only for descriptive checks when helpful.
+
+# Data loading and preparation
+
+```{r}
+# Read data
+train <- read_csv("../data/train.csv") %>% clean_names()
+test <- read_csv("../data/test.csv") %>% clean_names()
+
+# Quick glance
+glimpse(train)
+
+# Feature engineering
+train_prepped <- train %>%
+  mutate(
+    sex = factor(sex),
+    pclass = factor(pclass, levels = c(1,2,3), labels = c("First","Second","Third")),
+    survived = factor(survived, levels = c(0,1), labels = c("Died","Survived")),
+    # Derive family structure: immediate family onboard
+    family_size = sib_sp + parch + 1L,
+    family_structure = case_when(
+      family_size == 1 ~ "Alone",
+      family_size >= 2 & family_size <= 4 ~ "Small",
+      family_size >= 5 ~ "Large",
+      TRUE ~ NA_character_
+    ),
+    # Age bins for descriptive and modeling
+    age_group = case_when(
+      is.na(age) ~ "Unknown",
+      age < 5 ~ "Infant (<5)",
+      age < 13 ~ "Child (5-12)",
+      age < 18 ~ "Teen (13-17)",
+      age < 30 ~ "Young Adult (18-29)",
+      age < 45 ~ "Adult (30-44)",
+      age < 60 ~ "Mid-age (45-59)",
+      TRUE ~ "Senior (60+)"
+    ),
+    embarked = fct_na_value_to_level(factor(embarked), level = "Unknown")
+  )
+
+# Check missingness summary
+train_prepped %>% summarise(across(everything(), ~ sum(is.na(.))))
+```
+
+# Descriptive statistics
+
+## Survival by gender and SES
+
+```{r}
+# Survival rates by sex and class
+surv_by_sex_class <- train_prepped %>%
+  group_by(sex, pclass) %>%
+  summarise(survival_rate = mean(survived == "Survived"), n = n(), .groups = "drop")
+
+surv_by_sex_class
+
+ggplot(surv_by_sex_class, aes(pclass, survival_rate, fill = sex)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6) +
+  scale_y_continuous(labels = percent_format()) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Survival Rate by Gender and Passenger Class",
+       x = "Passenger Class (SES)", y = "Survival Rate", fill = "Gender") +
+  theme(legend.position = "bottom")
+```
+
+## Role of age, family structure, and embarkation
+
+```{r}
+# Survival by age group
+surv_by_age <- train_prepped %>%
+  group_by(age_group) %>%
+  summarise(survival_rate = mean(survived == "Survived"), n = n(), .groups = "drop") %>%
+  arrange(match(age_group, c("Infant (<5)","Child (5-12)","Teen (13-17)",
+                             "Young Adult (18-29)","Adult (30-44)",
+                             "Mid-age (45-59)","Senior (60+)","Unknown")))
+
+surv_by_age
+
+ggplot(surv_by_age, aes(age_group, survival_rate)) +
+  geom_col(width = 0.6, fill = "#10B981") +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "Survival Rate by Age Group", x = "Age Group", y = "Survival Rate") +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1), legend.position = "bottom")
+
+# Survival by family structure
+surv_by_family <- train_prepped %>%
+  group_by(family_structure) %>%
+  summarise(survival_rate = mean(survived == "Survived"), n = n(), .groups = "drop")
+
+surv_by_family
+
+ggplot(surv_by_family, aes(family_structure, survival_rate)) +
+  geom_col(width = 0.6, fill = "#F59E0B") +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "Survival Rate by Family Structure", x = "Family Structure", y = "Survival Rate") +
+  theme(legend.position = "bottom")
+
+# Survival by port of embarkation
+surv_by_embark <- train_prepped %>%
+  group_by(embarked) %>%
+  summarise(survival_rate = mean(survived == "Survived"), n = n(), .groups = "drop")
+
+surv_by_embark
+
+ggplot(surv_by_embark, aes(embarked, survival_rate)) +
+  geom_col(width = 0.6, fill = "#EF4444") +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "Survival Rate by Port of Embarkation", x = "Embarked", y = "Survival Rate") +
+  theme(legend.position = "bottom")
+```
+
+# Modeling: Joint effects and mediation checks
+
+We fit logistic regression models predicting survival with gender and SES, and then add age, family structure, and embarkation to see how the gender-SES effects change (a simple mediation-style check via attenuation of coefficients).
+
+```{r}
+# Base model: gender + class
+m1 <- glm(survived ~ sex + pclass, data = train_prepped %>% mutate(survived = as.integer(survived == "Survived")), family = binomial())
+
+# Add age (continuous), family structure, and embarkation
+m2 <- glm(survived ~ sex + pclass + age + family_structure + embarked, 
+          data = train_prepped %>% mutate(survived = as.integer(survived == "Survived")), 
+          family = binomial())
+
+# Add interaction between gender and SES
+m3 <- glm(survived ~ sex * pclass + age + family_structure + embarked, 
+          data = train_prepped %>% mutate(survived = as.integer(survived == "Survived")), 
+          family = binomial())
+
+# Tidy summaries with odds ratios
+summaries <- list(
+  m1 = tidy(m1, exponentiate = TRUE, conf.int = TRUE),
+  m2 = tidy(m2, exponentiate = TRUE, conf.int = TRUE),
+  m3 = tidy(m3, exponentiate = TRUE, conf.int = TRUE)
+)
+
+summaries
+
+# Compare changes in sex and class effects from m1 to m2 to m3
+sex_terms <- map_dfr(names(summaries), function(nm) {
+  summaries[[nm]] %>% filter(str_detect(term, "^sex")) %>% mutate(model = nm)
+})
+class_terms <- map_dfr(names(summaries), function(nm) {
+  summaries[[nm]] %>% filter(str_detect(term, "^pclass")) %>% mutate(model = nm)
+})
+
+sex_terms
+class_terms
+```
+
+## Predicted probabilities by age group and gender/class
+
+```{r}
+# Create representative grid for predictions
+pred_grid <- train_prepped %>%
+  transmute(
+    sex, pclass,
+    age_group,
+    age = if_else(is.na(age), median(age, na.rm = TRUE), age),
+    family_structure,
+    embarked
+  ) %>%
+  distinct(sex, pclass, age_group, family_structure, embarked) %>%
+  mutate(age = case_when(
+    age_group == "Infant (<5)" ~ 2.5,
+    age_group == "Child (5-12)" ~ 9,
+    age_group == "Teen (13-17)" ~ 15,
+    age_group == "Young Adult (18-29)" ~ 24,
+    age_group == "Adult (30-44)" ~ 37,
+    age_group == "Mid-age (45-59)" ~ 52,
+    age_group == "Senior (60+)" ~ 65,
+    TRUE ~ median(train_prepped$age, na.rm = TRUE)
+  ))
+
+preds <- pred_grid %>%
+  bind_cols(
+    predict(m3, newdata = pred_grid, type = "response") %>% as_tibble() %>% rename(pred_survival = value)
+  )
+
+# Visualize predicted survival across age group by sex and class
+pred_plot <- preds %>%
+  group_by(sex, pclass, age_group) %>%
+  summarise(pred_survival = mean(pred_survival), .groups = "drop")
+
+ggplot(pred_plot, aes(age_group, pred_survival, color = pclass, group = pclass)) +
+  geom_point() + geom_line() +
+  facet_wrap(~ sex, ncol = 1) +
+  scale_y_continuous(labels = percent_format()) +
+  scale_color_brewer(palette = "Dark2") +
+  labs(title = "Predicted Survival by Age Group, Gender, and Class",
+       x = "Age Group", y = "Predicted Survival", color = "Class") +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1), legend.position = "bottom")
+```
+
+# Results and interpretation
+
+## 1) Joint effects of gender and SES and mediation by age, family, and embarkation
+
+- Descriptively, females have markedly higher survival than males, and higher-class passengers have higher survival than lower-class.
+- In the base logistic model (m1), both female gender and higher SES (First/Second vs Third) show strong positive odds for survival.
+- Adding age, family structure, and embarkation (m2) typically attenuates some class effects and clarifies that younger ages and traveling with small families are associated with higher survival. Embarkation differences exist but are smaller compared to sex and class.
+- With interaction (m3), the advantage of female gender persists across classes; however, the gender gap can be somewhat larger in lower classes. The changes from m1 to m2/m3 suggest partial mediation: age and family structure account for some—but not all—of the class-based differences.
+
+## 2) Highest-risk age group
+
+- From the survival-by-age plot and the model-based predicted probabilities, the Senior (60+) and Mid-age (45-59) groups tend to have the lowest survival probabilities, with older adults (60+) generally at highest risk.
+
+## 3) Safety suggestions
+
+Based on the analysis:
+- Reinforce and operationalize “women and children first” protocols with clearer guidance and drills to ensure consistent application across all classes.
+- Improve equitable access to lifeboats and trained crew for lower classes; allocate lifeboat stations and crew assistance proportionally across decks to mitigate SES disparities.
+- Prioritize assistance for older adults and solos (traveling alone) during evacuations, as they show lower survival.
+- Enhance signage and muster procedures across embarkation points to reduce confusion; standardize instructions regardless of origin port.
+
+# Appendix: model coefficients tables
+
+```{r}
+# Present coefficient tables for m1, m2, m3
+summaries
+```
