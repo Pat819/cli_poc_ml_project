@@ -80,7 +80,7 @@ You may install additional R packages if needed.
 
 ## Iteration loop 
 
-### 1) Create a new git branh and start with a .qmd file
+### 1) Create and publish a new git branc and start with a .qmd file
 - Start a qmd file with proposed scripts that would help to address the research questions
 
 ### 2) Render the output
