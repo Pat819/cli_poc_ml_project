@@ -79,7 +79,7 @@ Example pattern:
 - `YYYYMMDD_HHMM_(Topic).qmd`
 - and the corresponding `.html`
 
-### 3) Render the output (and enforce correctness)
+### 3) Render the .html report
 - **Make Sure** Render the report to HTML.
 - The render **must** complete with zero errors.
 - If the render fails:
