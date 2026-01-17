@@ -1,0 +1,184 @@
+---
+title: "Deck Certainty and Survival on the Titanic"
+author: "CLI Copilot"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    self-contained: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Research Question
+Did location certainty affect survival beyond class and gender?
+
+# Plan
+Engineer deck/location features, build baseline and extended models, compare AUC/log loss and interactions.
+
+## Setup
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(stringr)
+library(lubridate)
+library(vip)
+library(pROC)
+```
+
+## Load data
+```{r}
+train <- read_csv("../../data/train.csv")
+test  <- read_csv("../../data/test.csv")
+```
+
+## Feature engineering: deck and certainty
+```{r}
+extract_deck <- function(cabin) {
+  if (is.na(cabin)) return(NA_character_)
+  m <- str_match(cabin, "^([A-Za-z])")
+  if (is.na(m[,2])) return(NA_character_)
+  m[,2]
+}
+
+extract_ticket_prefix <- function(ticket) {
+  if (is.na(ticket)) return(NA_character_)
+  ticket <- str_replace_all(ticket, "\\.", "")
+  m <- str_match(ticket, "^([A-Za-z]+)")
+  if (!is.na(m[,2])) return(m[,2])
+  m <- str_match(ticket, "^([A-Za-z]+[0-9]+)")
+  if (!is.na(m[,2])) return(m[,2])
+  parts <- str_split(ticket, "[ /]")[[1]]
+  if (length(parts)>1 && str_detect(parts[1], "[A-Za-z]")) return(parts[1])
+  NA_character_
+}
+
+train_feats <- train %>% mutate(
+  DeckKnown = !is.na(Cabin),
+  Deck = map_chr(Cabin, extract_deck),
+  TicketPrefix = map_chr(Ticket, extract_ticket_prefix)
+)
+
+deck_probs_by_key <- train_feats %>% 
+  filter(!is.na(Deck)) %>%
+  mutate(key = paste(coalesce(Pclass, -1), coalesce(Embarked, "?"), coalesce(TicketPrefix, "?"), sep="|")) %>%
+  count(key, Deck) %>%
+  group_by(key) %>%
+  mutate(p = n/sum(n)) %>%
+  ungroup()
+
+keys_df <- train_feats %>% mutate(
+  key_full = paste(coalesce(Pclass, -1), coalesce(Embarked, "?"), coalesce(TicketPrefix, "?"), sep="|"),
+  key_pe   = paste(coalesce(Pclass, -1), coalesce(Embarked, "?"), sep="|"),
+  key_p    = paste(coalesce(Pclass, -1), sep="|")
+)
+
+get_deck_dist <- function(k_full, k_pe, k_p) {
+  df <- deck_probs_by_key %>% filter(key == k_full)
+  if (nrow(df)==0) df <- deck_probs_by_key %>% filter(key == k_pe)
+  if (nrow(df)==0) df <- deck_probs_by_key %>% filter(key == k_p)
+  if (nrow(df)==0) {
+    df <- deck_probs_by_key %>% count(Deck, wt = p) %>% mutate(p = n/sum(n)) %>% select(Deck, p)
+  } else {
+    df <- df %>% select(Deck, p)
+  }
+  df
+}
+
+entropy <- function(probs) {
+  probs <- probs[probs>0]
+  -sum(probs * log2(probs))
+}
+
+featurize <- function(df) {
+  df2 <- df %>% mutate(
+    DeckKnown = !is.na(Cabin),
+    Deck = map_chr(Cabin, extract_deck),
+    TicketPrefix = map_chr(Ticket, extract_ticket_prefix),
+    key_full = paste(coalesce(Pclass, -1), coalesce(Embarked, "?"), coalesce(TicketPrefix, "?"), sep="|"),
+    key_pe   = paste(coalesce(Pclass, -1), coalesce(Embarked, "?"), sep="|"),
+    key_p    = paste(coalesce(Pclass, -1), sep="|")
+  )
+  deck_dist_list <- pmap(list(df2$key_full, df2$key_pe, df2$key_p), get_deck_dist)
+  deck_entropy <- map_dbl(deck_dist_list, ~ entropy(.x$p))
+  inferred_deck <- map_chr(deck_dist_list, ~ .x %>% arrange(desc(p)) %>% slice(1) %>% pull(Deck))
+  df2 <- df2 %>% mutate(
+    DeckInf = if_else(is.na(Deck), inferred_deck, Deck),
+    DeckAmbiguity = deck_entropy
+  )
+  df2 <- df2 %>% group_by(TicketPrefix) %>% mutate(LocalCrowding = n()) %>% ungroup()
+  df2
+}
+
+train_f <- featurize(train) %>% mutate(
+  Survived = factor(Survived),
+  DeckKnown = as.integer(DeckKnown),
+  DeckInf = factor(DeckInf),
+  Sex = factor(Sex),
+  Embarked = factor(Embarked),
+  Pclass = factor(Pclass)
+)
+```
+
+## Modeling: baseline vs extended
+```{r}
+set.seed(123)
+splits <- initial_split(train_f, prop = 0.8, strata = Survived)
+train_data <- training(splits)
+valid_data <- testing(splits)
+
+base_rec <- recipe(Survived ~ Sex + Age + Pclass + Fare + Embarked + SibSp + Parch, data=train_data) %>%
+  step_mutate(FamilySize = SibSp + Parch + 1) %>%
+  step_impute_mean(Age) %>%
+  step_dummy(all_nominal_predictors())
+
+ext_rec <- recipe(Survived ~ Sex + Age + Pclass + Fare + Embarked + SibSp + Parch + DeckInf + DeckAmbiguity + LocalCrowding, data=train_data) %>%
+  step_mutate(FamilySize = SibSp + Parch + 1) %>%
+  step_impute_mean(Age) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+log_spec <- logistic_reg(mode="classification") %>% set_engine("glm")
+
+base_wf <- workflow() %>% add_model(log_spec) %>% add_recipe(base_rec)
+ext_wf  <- workflow() %>% add_model(log_spec) %>% add_recipe(ext_rec)
+
+base_fit <- fit(base_wf, train_data)
+ext_fit  <- fit(ext_wf, train_data)
+
+base_pred <- predict(base_fit, valid_data, type="prob") %>% bind_cols(valid_data %>% select(Survived))
+ext_pred  <- predict(ext_fit, valid_data, type="prob") %>% bind_cols(valid_data %>% select(Survived))
+
+base_auc <- roc_auc(base_pred, truth = Survived, .pred_1)
+ext_auc  <- roc_auc(ext_pred,  truth = Survived, .pred_1)
+
+log_loss_fn <- function(y, p){
+  eps <- 1e-15
+  p <- pmax(pmin(p, 1-eps), eps)
+  -mean(as.integer(y=="1")*log(p) + as.integer(y!="1")*log(1-p))
+}
+base_ll <- log_loss_fn(base_pred$Survived, base_pred$.pred_1)
+ext_ll  <- log_loss_fn(ext_pred$Survived,  ext_pred$.pred_1)
+
+base_auc; ext_auc; base_ll; ext_ll
+```
+
+## Interactions: DeckAmbiguity with Pclass and Sex
+```{r}
+int_rec <- recipe(Survived ~ Sex + DeckAmbiguity + Pclass + Age + Fare + Embarked + SibSp + Parch + DeckInf + LocalCrowding, data=train_data) %>%
+  step_mutate(FamilySize = SibSp + Parch + 1) %>%
+  step_impute_mean(Age) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_interact(terms = ~ starts_with('Sex_'):DeckAmbiguity + starts_with('Pclass_'):DeckAmbiguity) %>%
+  step_normalize(all_numeric_predictors())
+
+int_wf <- workflow() %>% add_model(log_spec) %>% add_recipe(int_rec)
+int_fit <- fit(int_wf, train_data)
+int_pred <- predict(int_fit, valid_data, type="prob") %>% bind_cols(valid_data %>% select(Survived))
+int_auc <- roc_auc(int_pred, truth = Survived, .pred_1)
+int_ll  <- log_loss_fn(int_pred$Survived, int_pred$.pred_1)
+int_auc; int_ll
+```
