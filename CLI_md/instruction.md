@@ -46,6 +46,7 @@ execute:
 - Why did you decide to go with this code chunck?
 - How did it help answer the research question?
 - Also, comment your code to explain what each part does inline.
+- I need everything in **GREAT DETAILS** try as hard as possible to explain everything.
 
 #### ggplot desing
 - go with a consistent minimalist theme
@@ -80,34 +81,56 @@ You may install additional R packages if needed.
 
 ## Iteration loop 
 
-### 1) Create and publish a new git branch and start with a .qmd file
-- Start a qmd file with proposed scripts that would help to address the research questions
+### 1) Create and publish a new git branch, then start the first `.qmd`
+- Create and switch to a new descriptive branch.
+- Push the branch immediately so progress is backed up remotely.
+- Create an initial `.qmd` that functions as a **baseline analysis scaffold**:
+  - Include the preferred Quarto YAML header.
+  - Load libraries, define helper functions, set seeds, and configure consistent plotting themes.
+  - Import and validate data (types, ranges, missingness, duplicates).
+  - Add clearly named sections aligned to the research questions.
+  - Implement a first-pass EDA + baseline models that directly target the questions.
+- Keep the `.qmd` runnable end-to-end from a clean environment.
 
-### 2) Render the output
-- Render the report to the target format (e.g., HTML).
-- Ensure the build completes with zero errors.
-- If the render fails, fix issues and re-render until it succeeds.
+---
 
-### 3) Review the rendered output
-- Read the latest rendered .html output (not just the source).
-- Focus on the generated graphics, tables and use these information to address the research questions
-- Check for:
-  - completeness relative to the objectives
-  - correctness of results and interpretation
-  - clarity, readability, and narrative coherence
-  - presentation quality (figures, labels, headings, TOC)
-  - reproducibility (consistent results, no brittle steps)
-- Propose additional analyses, visualizations, or refinements needed.
+### 2) Render the output (and enforce correctness)
+- Render the report to HTML.
+- The render **must** complete with zero errors.
+- If the render fails:
+  - fix the underlying cause (packages, code, paths, chunk options, assumptions)
+  - re-render until it compiles cleanly
+- Treat the rendered HTML as the “source of truth” for what a reader will see.
 
-### 4) Make all new discovery and necessary adjustments to the .qmd file.
-- Based on the new information and findings from step 3, conduct further analysis on .qmd to refine and enhance the report.
-- In each section, all another text chunk to report all the main results based on the tables and figures output based on the .html in step 3.
-- How did the new results help answer the research questions?
+---
 
-### 5) Version control 
+### 3) Review the rendered HTML and upgrade the report in a new `.qmd`
+- Read the latest rendered `.html` output (not just the source).
+- Create a new `.qmd` version intended for **final reporting quality**, using what you learned from the HTML:
+  - Preserve working code, but improve structure, narrative flow, and interpretability.
+  - For every major section, add a dedicated **Results** text block that:
+    - summarizes the key patterns shown in figures/tables
+    - states the direction and magnitude of effects where possible
+    - explicitly links the evidence back to the research questions
+  - Use graphics/tables from the rendered HTML as the anchor:
+    - interpret what they show
+    - refine or replace plots/tables that do not support clear conclusions
+- Evaluate the HTML output against these checks:
+  - **Completeness:** are all objectives/questions answered explicitly?
+  - **Correctness:** are claims supported by outputs? are assumptions stated?
+  - **Interpretation quality:** do you distinguish association vs explanation where relevant?
+  - **Clarity:** readable headings, coherent story, minimal jargon, strong transitions
+  - **Presentation:** informative titles/captions, labeled axes, consistent formatting, TOC works
+  - **Reproducibility:** deterministic outputs, no brittle paths, minimal manual steps
+- Propose and implement additional analyses/visualizations/refinements as needed, such as:
+  - interaction plots / marginal effects / predicted probability curves
+  - sensitivity checks (alternative encodings/binnings, robustness to missingness)
+  - diagnostics and validation summaries to justify conclusions
+
+### 4) Version control 
 - Stage changes for both source and rendered output (as required).
 - Commit with an iteration-tagged message 
 - Push commits to the working branch.
 
-### 6) **Make Sure** Create a pull request 
+### 5) **Make Sure** Create a pull request 
 - After completing the third iteration, create a pull request to merge changes into `main` using gh pr create (provide title/body in the command or via flags).
