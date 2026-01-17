@@ -1,0 +1,200 @@
+---
+title: "Titanic social network and survival"
+author: "CLI Copilot"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    self-contained: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Plan and data
+
+In this report we infer hidden social structure from co-travel signals and test whether network position adds explanatory power for survival.
+
+Data available: train.csv with survival label, test.csv without label; fields include pclass, sex, age, sibsp, parch, ticket, fare, cabin, embarked.
+
+We will:
+- Infer travel groups using shared ticket, surname, cabin, and embarkation.
+- Build a passenger graph with edges indicating likely co-travel or association.
+- Engineer network features (group size, solo flag, class mix, centrality, presence of children or high-fare anchors).
+- Model survival with and without network features to assess added explanatory power.
+
+Assumptions:
+- Shared ticket implies strong co-travel tie.
+- Shared surname within same embarkation and similar ticket prefix suggests family or association, especially if parch/sibsp consistent.
+- Cabin proximity (same cabin string) indicates association mostly in higher classes.
+- Edges will be weighted by evidence strength.
+
+## Load data and setup
+
+```{r}
+library(readr)
+library(dplyr)
+library(stringr)
+library(tidyr)
+library(purrr)
+library(igraph)
+library(tidygraph)
+library(ggraph)
+library(broom)
+library(ggplot2)
+train <- read_csv("data/train.csv")
+# ensure consistent types
+train <- train %>% mutate(
+  ticket = as.character(ticket),
+  cabin = as.character(cabin),
+  embarked = as.character(embarked)
+)
+```
+
+Explanation: We load required libraries (tidyverse for wrangling, igraph/tidygraph/ggraph for network, broom for model tidying). We read the training data, and coerce key fields to character to avoid factor issues.
+
+## Parse name to extract surname
+
+```{r}
+train <- train %>% mutate(
+  Surname = str_extract(Name, "^[^,]+") %||% NA_character_,
+  TicketPrefix = str_to_upper(str_trim(str_replace(ticket, "[0-9]+", ""))),
+  TicketNum = as.integer(str_extract(ticket, "[0-9]+")),
+  CabinClean = str_replace_na(cabin, ""),
+  CabinFirst = str_trim(str_extract(CabinClean, "^[A-Za-z]"))
+)
+```
+
+Explanation: We extract surname from the Name field up to the comma, split ticket into alphanumeric prefix and numeric part, and get cabin deck letter as a coarse location indicator. These help infer associations.
+
+## Define edge evidence rules
+
+```{r}
+# helper functions
+shared_ticket_edges <- train %>%
+  group_by(ticket) %>% filter(n() > 1) %>%
+  summarize(PassengerId = list(PassengerId)) %>%
+  transmute(from = map_int(PassengerId, ~ .x[1]),
+            to = map(PassengerId, ~ .x[-1])) %>%
+  unnest(to) %>% mutate(weight = 3, reason = "shared_ticket")
+
+shared_surname_edges <- train %>%
+  group_by(Surname, embarked) %>% filter(n() > 1) %>%
+  summarize(PassengerId = list(PassengerId), .groups = "drop") %>%
+  transmute(from = map_int(PassengerId, ~ .x[1]),
+            to = map(PassengerId, ~ .x[-1])) %>%
+  unnest(to) %>% mutate(weight = 1, reason = "shared_surname_embark")
+
+shared_cabin_edges <- train %>%
+  filter(!is.na(cabin)) %>%
+  group_by(cabin) %>% filter(n() > 1) %>%
+  summarize(PassengerId = list(PassengerId), .groups = "drop") %>%
+  transmute(from = map_int(PassengerId, ~ .x[1]),
+            to = map(PassengerId, ~ .x[-1])) %>%
+  unnest(to) %>% mutate(weight = 2, reason = "shared_cabin")
+
+edges <- bind_rows(shared_ticket_edges, shared_surname_edges, shared_cabin_edges)
+```
+
+Explanation: We create edges for three signals, assigning weights: ticket strongest (3), cabin medium (2), surname+embark weak (1).
+
+## Build graph and groups
+
+```{r}
+vertices <- train %>% select(PassengerId, Sex = Sex, Age = Age, Pclass = Pclass, Fare = Fare, SibSp, Parch)
+g <- graph_from_data_frame(edges, directed = FALSE, vertices = vertices)
+# components as groups
+comp <- components(g)
+train <- train %>% mutate(GroupId = comp$membership[match(PassengerId, as.integer(names(comp$membership)))])
+```
+
+Explanation: We build an undirected graph of passengers connected by co-travel signals, then compute connected components to define groups, mapping each passenger to a GroupId.
+
+## Engineer network features
+
+```{r}
+# group features
+group_feats <- vertices %>%
+  left_join(train %>% select(PassengerId, GroupId, Embarked = embarked, Fare), by = "PassengerId") %>%
+  group_by(GroupId) %>%
+  summarize(
+    group_size = n(),
+    group_pclass_mix = n_distinct(Pclass),
+    group_has_child = any(!is.na(Age) & Age < 16),
+    group_fare_max = max(Fare, na.rm = TRUE),
+    group_fare_mean = mean(Fare, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# centrality using tidygraph
+tg <- as_tbl_graph(g)
+cent <- tg %>% activate(nodes) %>% mutate(
+  degree = centrality_degree(),
+  betweenness = centrality_betweenness(),
+  closeness = centrality_closeness()
+) %>% as_tibble() %>% transmute(PassengerId, degree, betweenness, closeness)
+
+net_feats <- train %>% select(PassengerId, Survived, Sex = Sex, Age = Age, Pclass = Pclass, SibSp, Parch) %>%
+  left_join(group_feats, by = c("PassengerId" = "PassengerId")) %>%
+  left_join(cent, by = "PassengerId") %>%
+  mutate(
+    solo = if_else(group_size %in% c(NA, 1), TRUE, FALSE)
+  )
+```
+
+Explanation: We compute group-level features and node centralities, then merge into a feature frame including baseline demographics. Solo indicates likely traveling alone.
+
+## Model survival: baseline vs +network
+
+```{r}
+# baseline logistic
+baseline <- glm(Survived ~ Sex + Age + Pclass + SibSp + Parch, data = net_feats, family = binomial())
+base_tidy <- tidy(baseline)
+
+# add network features
+with_net <- glm(Survived ~ Sex + Age + Pclass + SibSp + Parch + solo + group_size + group_pclass_mix + group_has_child + degree + betweenness + closeness + group_fare_mean,
+                data = net_feats, family = binomial())
+with_tidy <- tidy(with_net)
+
+# compare AIC as a simple metric
+model_comp <- tibble(model = c("baseline","with_net"), AIC = c(AIC(baseline), AIC(with_net)))
+
+base_tidy
+with_tidy
+model_comp
+```
+
+Explanation: We fit two logistic models and compare AIC to see if network features add explanatory power. We also inspect coefficient changes to understand effect sizes and interactions indirectly.
+
+## Visualize groups and degree distribution
+
+```{r}
+# degree distribution plot
+cent %>% ggplot(aes(degree)) + geom_histogram(binwidth = 1, fill = "steelblue") +
+  theme_minimal() + theme(legend.position = "bottom") +
+  labs(title = "Degree distribution in inferred travel network", x = "Degree", y = "Count")
+
+# example: plot largest component
+largest_group <- group_feats %>% filter(group_size == max(group_size, na.rm = TRUE)) %>% slice(1) %>% pull(GroupId)
+subgraph_nodes <- train %>% filter(GroupId == largest_group) %>% pull(PassengerId)
+subg <- induced_subgraph(g, vids = subgraph_nodes)
+
+set.seed(123)
+ggraph(subg, layout = "fr") +
+  geom_edge_link(alpha = 0.4) +
+  geom_node_point(aes(color = as.factor(vertices$Pclass[match(name, vertices$PassengerId)])), size = 3) +
+  theme_minimal() + theme(legend.position = "bottom") +
+  labs(title = "Largest inferred travel group", color = "Pclass")
+```
+
+Explanation: We visualize the network’s degree distribution and one large component with nodes colored by class, using a minimalist ggplot theme and bottom legends for consistency with instructions.
+
+## Interpretation notes
+
+- If AIC decreases with network features, social embedding likely explains additional variance.
+- Positive solo effect would suggest traveling alone reduced survival, perhaps due to lacking support; negative could mean solo males in 3rd had lower survival while solo females may have higher, requiring interaction terms in future iterations.
+- High degree or betweenness associated with survival may reflect being embedded in groups that coordinated evacuation; the opposite could indicate crowding effects.
+
+Limitations: Name parsing is heuristic; surname sharing can include unrelated individuals. Cabin sharing mostly applies to upper class. Further iterations could refine edge rules (e.g., ticket prefix proximity, age gaps within surname groups), and add interaction terms (Sex:solo, Pclass:group_size).
