@@ -1,0 +1,298 @@
+---
+title: "Titanic Two-Stage Survival: Policy Scenario Forecasts"
+author: "CLI Copilot"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    self-contained: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+
+```{r}
+#| label: setup
+#| echo: true
+# This chunk sets up libraries and global options.
+# We use tidyverse for data manipulation and ggplot2 for visualization.
+# broom and mgcv for modeling, rsample for bootstrap, and patchwork for small multiples.
+# Assumptions: packages are available; if not, we install them.
+
+pkgs <- c("tidyverse","broom","mgcv","rsample","patchwork")
+missing <- pkgs[!pkgs %in% installed.packages()[,"Package"]]
+if(length(missing)) install.packages(missing, repos = "https://cloud.r-project.org")
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(broom)
+  library(mgcv)
+  library(rsample)
+  library(patchwork)
+})
+
+theme_set(theme_minimal(base_size = 12))
+update_geom_defaults("line", list(size = 0.8))
+update_geom_defaults("ribbon", list(alpha = 0.15))
+```
+
+
+```{r}
+#| label: load-data
+# We load the provided Titanic train/test CSVs from data/.
+# We focus on train.csv which includes the Survived outcome.
+# We ensure categorical variables are properly factored and create helpful features.
+
+train <- read_csv("../data/train.csv", show_col_types = FALSE)
+
+# Basic cleaning and feature engineering assumptions:
+# - Pclass, Sex, Embarked are categorical
+# - Age may have missing; we impute with class/sex medians for interpretability
+# - Group features: family size via SibSp + Parch, ticket group proxy via first token
+# - Deck proxy from Cabin first letter; missing treated as "U" (unknown)
+
+data <- train %>%
+  mutate(
+    Pclass = factor(Pclass),
+    Sex = factor(Sex),
+    Embarked = factor(Embarked),
+    FamilySize = SibSp + Parch + 1,
+    TicketPrefix = str_trim(str_extract(Ticket, "^[A-Za-z./ ]+")),
+    TicketPrefix = if_else(is.na(TicketPrefix) | TicketPrefix == "", "NUM", TicketPrefix),
+    TicketPrefix = forcats::fct_lump_n(TicketPrefix, n = 10),
+    Deck = str_extract(Cabin, "[A-Za-z]"),
+    Deck = if_else(is.na(Deck), "U", Deck),
+    Deck = factor(Deck),
+    AgeBand = cut(Age, breaks = c(-Inf, 12, 18, 35, 55, Inf), labels = c("child","teen","young","adult","senior"), right = TRUE)
+  )
+
+# Median imputation for Age within Sex x Pclass groups for interpretability
+age_imp <- data %>% group_by(Sex, Pclass) %>% summarise(med_age = median(Age, na.rm = TRUE), .groups = "drop")
+
+data <- data %>%
+  left_join(age_imp, by = c("Sex","Pclass")) %>%
+  mutate(Age = if_else(is.na(Age), med_age, Age),
+         AgeBand = cut(Age, breaks = c(-Inf, 12, 18, 35, 55, Inf), labels = c("child","teen","young","adult","senior"), right = TRUE)) %>%
+  select(-med_age)
+
+# Verify
+glimpse(data)
+```
+
+
+```{r}
+#| label: stage-a-model
+# Stage A: Access/Priority model
+# We fit interpretable logistic models for Survived ~ Sex + Age + Pclass + Fare + Embarked + SibSp + Parch (+ group proxies).
+# We compare glm (logistic) and a GAM to capture smooth age effect.
+# Assumption: Effects here proxy access or priority to lifeboats.
+
+# Logistic regression with main effects
+modA_glm <- glm(Survived ~ Sex + scale(Age) + Pclass + scale(Fare) + Embarked + SibSp + Parch +
+                  FamilySize + TicketPrefix,
+                data = data, family = binomial())
+
+# GAM with smooth age and class/sex
+modA_gam <- mgcv::gam(Survived ~ Sex + s(Age, bs = "cs") + Pclass + s(Fare, bs = "cs") + Embarked + SibSp + Parch +
+                        FamilySize + TicketPrefix,
+                      data = data, family = binomial())
+
+summary(modA_glm)
+summary(modA_gam)
+
+# Partial dependence-like effects for key variables from GAM
+age_grid <- tibble(Age = seq(min(data$Age, na.rm = TRUE), max(data$Age, na.rm = TRUE), length.out = 100))
+ref_row <- data %>% summarise(
+  Sex = names(sort(table(Sex), decreasing = TRUE))[1],
+  Pclass = names(sort(table(Pclass), decreasing = TRUE))[1],
+  Age = median(Age, na.rm = TRUE),
+  Fare = median(Fare, na.rm = TRUE),
+  Embarked = names(sort(table(Embarked), decreasing = TRUE))[1],
+  SibSp = 0, Parch = 0, FamilySize = 1, TicketPrefix = "NUM"
+)
+
+pd_age <- age_grid %>% crossing(ref_row %>% dplyr::select(-Age)) %>% mutate(.pred = predict(modA_gam, ., type = "response"))
+
+pd_sex <- data %>% distinct(Sex) %>% crossing(ref_row %>% select(-Sex)) %>% mutate(.pred = predict(modA_gam, ., type = "response"))
+
+pd_pclass <- data %>% distinct(Pclass) %>% crossing(ref_row %>% select(-Pclass)) %>% mutate(.pred = predict(modA_gam, ., type = "response"))
+
+# Visualize partials
+p_age <- ggplot(pd_age, aes(Age, .pred)) + geom_line() + labs(title = "Effect of Age (Stage A)", y = "Predicted survival")
+p_sex <- ggplot(pd_sex, aes(Sex, .pred)) + geom_col() + labs(title = "Effect of Sex (Stage A)", y = "Predicted survival")
+p_pclass <- ggplot(pd_pclass, aes(Pclass, .pred)) + geom_col() + labs(title = "Effect of Pclass (Stage A)", y = "Predicted survival")
+
+p_age + p_sex + p_pclass
+```
+
+
+```{r}
+#| label: stage-a-scores
+# Compute access/priority scores from Stage A (GAM predictions).
+# We use the predicted probability as access score and examine top quantile.
+
+data <- data %>% mutate(access_score = predict(modA_gam, newdata = data, type = "response"))
+
+summary(data$access_score)
+
+high_access <- data %>% filter(!is.na(access_score)) %>% filter(access_score >= quantile(access_score, 0.7, na.rm = TRUE))
+
+nrow(high_access) / nrow(data)
+```
+
+
+```{r}
+#| label: stage-b-model
+# Stage B: Conditional survival among likely-prioritized passengers.
+# We model remaining variance with deck/cabin proxies, group size, and key interactions (Deck x Pclass, Age x Sex).
+
+modB_glm <- glm(Survived ~ Deck * Pclass + FamilySize + Sex * scale(Age) + TicketPrefix,
+                data = high_access, family = binomial())
+
+modB_gam <- mgcv::gam(Survived ~ Deck * Pclass + s(Age, by = Sex, bs = "cs") + FamilySize + TicketPrefix,
+                      data = high_access, family = binomial())
+
+summary(modB_glm)
+summary(modB_gam)
+
+# What factors still matter after accounting for access: tidy coefficients
+broom::tidy(modB_glm, exponentiate = TRUE) %>% arrange(p.value) %>% head(20)
+```
+
+
+```{r}
+#| label: forecasting-scenarios
+# Forecasting exercise: simulate policy scenarios by modifying inputs or effect strengths.
+# We define helper functions to adjust stage A effects and recompute predictions.
+# Scenarios:
+#  - stronger sex and age priority (boost female, children)
+#  - reduced class effect (shrink Pclass influence)
+#  - improved access for low decks (boost inferred low-deck groups)
+
+# Base prediction function
+predict_stageA <- function(df, model) predict(model, newdata = df, type = "link")
+inv_logit <- function(x) 1/(1+exp(-x))
+
+# Scenario transformers operate on linear predictor of Stage A
+lp_base <- predict_stageA(data, modA_gam)
+
+# Identify coefficients via approximate contrasts by refitting with parametric terms where needed
+# We will create heuristic adjustments using indicator multipliers for Sex, AgeBand, Pclass, Deck.
+
+data_scn <- data %>% mutate(
+  lp_base = lp_base,
+  female = as.integer(Sex == "female"),
+  child = as.integer(AgeBand == "child"),
+  pclass2 = as.integer(Pclass == "2"),
+  pclass3 = as.integer(Pclass == "3"),
+  low_deck = as.integer(Deck %in% c("E","F","G","U"))
+)
+
+apply_scenario <- function(df, scenario = c("strong_sex_age","reduced_pclass","boost_low_deck")) {
+  scenario <- match.arg(scenario)
+  adj <- rep(0, nrow(df))
+  if (scenario == "strong_sex_age") {
+    # boost female and children access by adding to linear predictor
+    adj <- 0.5*df$female + 0.5*df$child
+  } else if (scenario == "reduced_pclass") {
+    # shrink class effect by subtracting influence for lower classes
+    adj <- 0.3*df$pclass2 + 0.6*df$pclass3
+    adj <- -adj
+  } else if (scenario == "boost_low_deck") {
+    # improve access for low decks/unknown
+    adj <- 0.4*df$low_deck
+  }
+  df %>% mutate(lp_scn = lp_base + adj, surv_scn = inv_logit(lp_scn))
+}
+
+scenarios <- c("strong_sex_age","reduced_pclass","boost_low_deck")
+scn_results <- map(scenarios, ~ apply_scenario(data_scn, .x) %>% mutate(scenario = .x)) %>% bind_rows()
+
+# Summaries: overall survival and subgroup by Sex x Pclass x AgeBand
+overall_summary <- scn_results %>% group_by(scenario) %>% summarise(pred_survival = mean(surv_scn), .groups = "drop")
+subgroup_summary <- scn_results %>% group_by(scenario, Sex, Pclass, AgeBand) %>% summarise(pred_survival = mean(surv_scn), n = n(), .groups = "drop")
+
+knitr::kable(overall_summary, digits = 3, caption = "Overall predicted survival by scenario")
+knitr::kable(subgroup_summary %>% arrange(scenario, Sex, Pclass, AgeBand), digits = 3, caption = "Subgroup predicted survival by scenario")
+```
+
+
+```{r}
+#| label: bootstrap-uncertainty
+# Uncertainty via bootstrap resampling of training data and refitting Stage A.
+# For speed, we use a modest number of bootstrap replicates.
+
+set.seed(123)
+boot_reps <- 200
+
+boot_stats <- function(split) {
+  df <- analysis(split)
+  # repeat minimal preprocessing: ensure factors
+  df <- df %>% mutate(
+    Pclass = factor(Pclass), Sex = factor(Sex), Embarked = factor(Embarked),
+    FamilySize = SibSp + Parch + 1,
+    TicketPrefix = str_trim(str_extract(Ticket, "^[A-Za-z./ ]+")),
+    TicketPrefix = if_else(is.na(TicketPrefix) | TicketPrefix == "", "NUM", TicketPrefix),
+    TicketPrefix = forcats::fct_lump_n(TicketPrefix, n = 10),
+    Deck = str_extract(Cabin, "[A-Za-z]"), Deck = if_else(is.na(Deck), "U", Deck), Deck = factor(Deck)
+  )
+  # simple age impute
+  age_imp <- df %>% group_by(Sex, Pclass) %>% summarise(med_age = median(Age, na.rm = TRUE), .groups = "drop")
+  df <- df %>% left_join(age_imp, by = c("Sex","Pclass")) %>% mutate(Age = if_else(is.na(Age), med_age, Age)) %>% select(-med_age)
+  m <- mgcv::gam(Survived ~ Sex + s(Age, bs = "cs") + Pclass + s(Fare, bs = "cs") + Embarked + SibSp + Parch + FamilySize + TicketPrefix,
+                 data = df, family = binomial())
+  # Align factor levels in newdata to training df to avoid level mismatches
+  nd <- data_scn %>% mutate(
+    Sex = factor(Sex, levels = levels(df$Sex)),
+    Pclass = factor(Pclass, levels = levels(df$Pclass)),
+    Embarked = factor(Embarked, levels = levels(df$Embarked)),
+    Deck = factor(Deck, levels = levels(df$Deck)),
+    TicketPrefix = factor(TicketPrefix, levels = levels(df$TicketPrefix))
+  )
+  # Predict under scenarios on the original full data_scn for comparability
+  lp <- predict(m, newdata = nd, type = "link")
+  df2 <- nd %>% mutate(lp_base = lp)
+  res <- map_dfr(scenarios, function(s)
+    apply_scenario(df2, s) %>% summarise(scenario = s, overall = mean(surv_scn)))
+  res
+}
+
+boots <- bootstraps(train, times = boot_reps, strata = Survived)
+boot_out <- map_dfr(boots$splits, boot_stats)
+
+uncertainty <- boot_out %>% group_by(scenario) %>% summarise(
+  mean = mean(overall, na.rm = TRUE),
+  sd = sd(overall, na.rm = TRUE),
+  lo = quantile(overall, 0.10, na.rm = TRUE),
+  hi = quantile(overall, 0.90, na.rm = TRUE),
+  .groups = "drop"
+)
+
+knitr::kable(uncertainty, digits = 3, caption = "Bootstrap uncertainty (overall survival)")
+```
+
+
+```{r}
+#| label: dashboard-visuals
+# Scenario forecast dashboard: small multiples of predicted survival by subgroup with uncertainty ribbons.
+# We combine subgroup predictions with bootstrap intervals (overall shown, subgroup intervals omitted for brevity).
+
+p_overall <- ggplot(uncertainty, aes(scenario, mean)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = lo, ymax = hi), width = 0.2) +
+  labs(title = "Overall predicted survival across scenarios", y = "Mean survival (with 10-90% CI)", x = "Scenario") +
+  theme(legend.position = "bottom")
+
+p_sub <- subgroup_summary %>%
+  ggplot(aes(x = AgeBand, y = pred_survival, fill = Sex)) +
+  geom_col(position = position_dodge(width = 0.8)) +
+  facet_grid(Pclass ~ scenario) +
+  labs(title = "Subgroup predicted survival by scenario", y = "Predicted survival", x = "Age band") +
+  scale_fill_brewer(palette = "Set2") +
+  theme(legend.position = "bottom")
+
+p_overall / p_sub
+```
