@@ -1,0 +1,365 @@
+---
+title: "Titanic: Mechanisms of Survival Inequality — Iteration 1"
+author: "CLI Copilot"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    self-contained: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Setup and reproducibility
+
+This section explains the environment setup and conventions used throughout the report. The goal is to ensure a clean, deterministic run from a fresh R session.
+
+```{r}
+#| label: setup
+#| include: true
+# Reproducibility and package setup -------------------------------------------------
+set.seed(1234)
+
+req_pkgs <- c(
+  "tidyverse", "janitor", "broom", "stringr", "forcats", "viridis", "knitr"
+)
+
+# Install any missing packages (quietly) so the document renders end-to-end
+missing <- setdiff(req_pkgs, rownames(installed.packages()))
+if (length(missing) > 0) {
+  install.packages(missing, quiet = TRUE)
+}
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(janitor)
+  library(broom)
+  library(stringr)
+  library(forcats)
+  library(viridis)
+  library(knitr)
+})
+
+# Minimal, consistent theme for all plots
+theme_set(theme_minimal(base_size = 12))
+
+# Helper to create nice odds ratio tables from glm objects
+as_or_table <- function(m) {
+  broom::tidy(m, conf.int = TRUE, exponentiate = TRUE) %>%
+    mutate(across(c(estimate, conf.low, conf.high), ~round(.x, 3))) %>%
+    rename(OR = estimate, `2.5%` = conf.low, `97.5%` = conf.high)
+}
+```
+
+Text rationale: We load a small, standard stack for data manipulation, modeling, and plotting. We set a consistent ggplot theme and define a convenience function to present logistic regression as odds ratios with confidence intervals.
+
+# Data import and validation
+
+We import the canonical Kaggle Titanic train/test CSV files, validate structure and types, and perform basic sanity checks (missingness, ranges, duplicates). All downstream analysis uses the training set where Survived is observed.
+
+```{r}
+#| label: data-import
+#| include: true
+train_path <- here::here("data", "train.csv")
+test_path  <- here::here("data", "test.csv")
+
+# If 'here' is not available, fall back to relative path
+if (!file.exists(train_path)) train_path <- file.path("data", "train.csv")
+if (!file.exists(test_path))  test_path  <- file.path("data", "test.csv")
+
+train <- read_csv(train_path, show_col_types = FALSE) %>% clean_names()
+test  <- read_csv(test_path,  show_col_types = FALSE) %>% clean_names()
+
+# Basic structure
+list(
+  train_dim = dim(train),
+  test_dim  = dim(test),
+  train_cols = colnames(train)
+)
+```
+
+```{r}
+#| label: data-validate
+# Quick checks: types and missingness
+skim_summary <- train %>%
+  summarize(
+    across(everything(), ~sum(is.na(.x))),
+    .groups = "drop"
+  )
+
+# Missingness rates table (top variables of interest)
+missing_tbl <- tibble(
+  variable = names(train),
+  missing_n = map_int(train, ~sum(is.na(.x)))
+) %>%
+  mutate(missing_pct = round(100 * missing_n / nrow(train), 1)) %>%
+  arrange(desc(missing_pct))
+
+head(missing_tbl, 10) %>%
+  kable(caption = "Variables with highest missingness (train)")
+```
+
+Text rationale: We confirm that train/test are present and count missingness. This guides feature engineering choices and the design of sensitivity analyses in RQ3.
+
+# Feature engineering: social visibility, group context, and access proxies
+
+We construct features aligning to the research questions:
+- Titles from names (proxy for social role/status)
+- Family composition and solo travel
+- Ticket group size (crowd context)
+- Cabin missingness and first letter (location/access proxy)
+- Access proxies via fare level and embarkation
+
+```{r}
+#| label: feature-engineering
+# Helper: extract title between comma and period, standardize rare variants
+extract_title <- function(name) {
+  t <- str_trim(str_extract(name, ",\\s*[^.]+\\."))
+  t <- str_remove_all(t, "[.,]") %>% str_trim()
+  # Map rare titles to common buckets for stability
+  case_when(
+    t %in% c("Mlle", "Ms") ~ "Miss",
+    t %in% c("Mme") ~ "Mrs",
+    t %in% c("Lady", "the Countess", "Dona") ~ "Noblewoman",
+    t %in% c("Sir", "Don", "Jonkheer") ~ "Nobleman",
+    t %in% c("Capt", "Col", "Major") ~ "Officer",
+    t %in% c("Dr", "Rev") ~ "Professional",
+    TRUE ~ t
+  )
+}
+
+engineer <- function(df) {
+  df %>%
+    mutate(
+      pclass = factor(pclass),
+      sex = factor(sex),
+      embarked = factor(embarked),
+      title = extract_title(name),
+      title = fct_lump_min(title, min = 10) %>% fct_relevel("Mr", "Mrs", "Miss", "Master"),
+      family_size = sib_sp + parch + 1L,
+      is_alone = family_size == 1L,
+      ticket_group_size = ave(passenger_id, ticket, FUN = length),
+      cabin_missing = is.na(cabin),
+      cabin_letter = if_else(is.na(cabin), NA_character_, str_sub(cabin, 1, 1)),
+      cabin_letter = factor(cabin_letter),
+      fare_log1p = log1p(fare),
+      child = if_else(!is.na(age) & age < 16, TRUE, FALSE)
+    )
+}
+
+train_fe <- engineer(train)
+```
+
+```{r}
+#| label: feature-sanity
+# Quick EDA views for engineered variables
+train_fe %>%
+  count(title, sort = TRUE) %>%
+  kable(caption = "Title distribution (train)")
+
+train_fe %>%
+  count(ticket_group_size) %>%
+  arrange(ticket_group_size) %>%
+  kable(caption = "Ticket group size distribution (train)")
+```
+
+Text rationale: Titles approximate social roles; group size and being alone capture coordination context; cabin info and fare proxy physical access. We keep factors ordered and use conservative lumping for rare titles to avoid unstable estimates.
+
+# RQ1. How much of the class–survival gap is explained by access and constraints vs “priority rules”?
+
+Approach: Compare a class-only model to a class plus access-proxies model and quantify how the Pclass odds ratios shrink.
+
+```{r}
+#| label: rq1-models
+# Model A: class only
+mA <- glm(survived ~ pclass, data = train_fe, family = binomial())
+# Model B: class + access proxies (avoid Age to keep N complete)
+mB <- glm(
+  survived ~ pclass + cabin_missing + cabin_letter + fare_log1p + embarked + ticket_group_size,
+  data = train_fe,
+  family = binomial()
+)
+
+list(
+  class_only = as_or_table(mA) %>% filter(str_detect(term, "pclass")),
+  class_plus_access = as_or_table(mB) %>% filter(str_detect(term, "pclass"))
+)
+```
+
+```{r}
+#| label: rq1-shrinkage
+# Quantify shrinkage in the class coefficients (odds ratios)
+A <- as_or_table(mA) %>% filter(str_detect(term, "pclass")) %>% select(term, OR) %>% rename(OR_A = OR)
+B <- as_or_table(mB) %>% filter(str_detect(term, "pclass")) %>% select(term, OR) %>% rename(OR_B = OR)
+
+shr_tbl <- A %>% left_join(B, by = "term") %>% mutate(shrink_pct = round(100 * (1 - OR_B/OR_A), 1))
+
+kable(shr_tbl, caption = "RQ1: Shrinkage in class effect after adding access proxies (positive = shrink)")
+```
+
+```{r}
+#| label: rq1-plot
+# Visualize predicted probabilities by class for both models
+newdat <- expand_grid(
+  pclass = levels(train_fe$pclass),
+  cabin_missing = c(TRUE, FALSE),
+  cabin_letter = fct_explicit_na(fct_lump(train_fe$cabin_letter, n = 5), "(Missing)"),
+  fare_log1p = median(train_fe$fare_log1p, na.rm = TRUE),
+  embarked = fct_explicit_na(fct_lump(train_fe$embarked, n = 3), "(Missing)"),
+  ticket_group_size = median(train_fe$ticket_group_size, na.rm = TRUE)
+) %>% distinct(pclass, .keep_all = TRUE)
+
+predA <- tibble(
+  pclass = levels(train_fe$pclass),
+  model = "Class only",
+  .pred = predict(mA, newdata = tibble(pclass = levels(train_fe$pclass)), type = "response")
+)
+
+predB <- newdat %>%
+  mutate(.pred = predict(mB, newdata = newdat, type = "response"), model = "Class + access") %>%
+  select(pclass, model, .pred)
+
+bind_rows(predA, predB) %>%
+  ggplot(aes(x = pclass, y = .pred, color = model, group = model)) +
+  geom_point(size = 3) +
+  geom_line() +
+  scale_color_viridis(discrete = TRUE, end = 0.8) +
+  labs(
+    title = "Predicted survival by class: class-only vs with access controls",
+    x = "Pclass",
+    y = "Predicted probability of survival",
+    color = "Model"
+  ) +
+  theme(legend.position = "bottom")
+```
+
+Results: The shrinkage table quantifies how much of the class advantage is captured by access proxies. A substantial positive shrinkage suggests that location/access and constraints explain a meaningful share of the raw class gap beyond any policy preference.
+
+# RQ2. Were survival “rules” applied consistently, or contingent on group context and visibility?
+
+Approach: Test interactions between sex, being a child, and social context (alone vs with family; ticket group size). Include title and class controls to probe whether norms (e.g., women/children first) vary by coordination context.
+
+```{r}
+#| label: rq2-model
+# Restrict to records with Age for the child indicator
+vars_rq2 <- c("survived","sex","pclass","age","is_alone","ticket_group_size","title","fare_log1p","embarked")
+train_rq2 <- train_fe %>% select(all_of(vars_rq2)) %>% drop_na(age)
+
+mC <- glm(
+  survived ~ sex * I(age < 16) * is_alone + pclass + title + fare_log1p + embarked,
+  data = train_rq2,
+  family = binomial()
+)
+
+as_or_table(mC) %>%
+  filter(!str_detect(term, "(Intercept)")) %>%
+  arrange(desc(OR)) %>%
+  kable(caption = "RQ2: Interaction model (odds ratios)")
+```
+
+```{r}
+#| label: rq2-effects
+# Marginal patterns: predicted probabilities across context
+new_rq2 <- expand_grid(
+  sex = levels(train_rq2$sex),
+  child = c(FALSE, TRUE),
+  is_alone = c(FALSE, TRUE),
+  pclass = levels(train_rq2$pclass),
+  title = fct_collapse(fct_lump(train_rq2$title, n = 5), Other = setdiff(levels(train_rq2$title), levels(fct_lump(train_rq2$title, 5)))) %>% levels(),
+  fare_log1p = median(train_rq2$fare_log1p, na.rm = TRUE),
+  embarked = fct_explicit_na(fct_lump(train_rq2$embarked, n = 3), "(Missing)")
+) %>%
+  mutate(age = if_else(child, 8, 30), title = factor(title, levels = levels(fct_lump(train_rq2$title, 5))))
+
+new_rq2 <- new_rq2 %>% mutate(
+  .pred = predict(mC, newdata = new_rq2 %>% mutate(child = NULL) %>% rename(`I(age < 16)` = child), type = "response")
+)
+
+new_rq2 %>%
+  group_by(sex, is_alone, child) %>%
+  summarize(prob = mean(.pred), .groups = "drop") %>%
+  ggplot(aes(x = interaction(sex, child, sep = ": child="), y = prob, fill = is_alone)) +
+  geom_col(position = position_dodge(width = 0.6)) +
+  scale_fill_viridis(discrete = TRUE, end = 0.8, option = "D") +
+  labs(
+    title = "Predicted survival by sex × child × solo travel",
+    x = "Group",
+    y = "Predicted probability",
+    fill = "Is alone"
+  ) +
+  theme(legend.position = "bottom")
+```
+
+Results: If the interaction Sex × Child × IsAlone is strong, the effectiveness of “women and children first” depends on coordination context (traveling alone vs with family). Title effects interacting with class would suggest visibility/status modulation; we include Title and Pclass main effects here for interpretability in a first pass and can expand interactions in the next iteration.
+
+# RQ3. Is missing data itself a signal of inequality in recordkeeping—and does it bias conclusions?
+
+Approach: Examine whether Age/Cabin missingness aligns with class, embarkation, and survival. Then check sensitivity of RQ2 inferences to simple imputation.
+
+```{r}
+#| label: rq3-missing-patterns
+miss_long <- train_fe %>%
+  transmute(
+    survived = factor(survived), pclass, sex, embarked,
+    age_miss = is.na(age), cabin_miss = is.na(cabin)
+  )
+
+miss_rates <- miss_long %>%
+  summarize(
+    age_missing = mean(age_miss),
+    cabin_missing = mean(cabin_miss)
+  ) %>% mutate(across(everything(), ~round(100*.x, 1)))
+
+by_class <- miss_long %>% group_by(pclass) %>%
+  summarize(age_missing = mean(age_miss), cabin_missing = mean(cabin_miss)) %>%
+  mutate(across(where(is.numeric), ~round(100*.x, 1)))
+
+kable(miss_rates, caption = "Overall missingness rates (%): Age, Cabin")
+by_class %>% kable(caption = "Missingness (%) by Pclass")
+```
+
+```{r}
+#| label: rq3-missing-association
+# Association with survival
+assoc <- miss_long %>%
+  group_by(age_miss, cabin_miss) %>%
+  summarize(survival_rate = mean(as.numeric(as.character(survived))), n = n(), .groups = "drop")
+
+kable(assoc %>% arrange(desc(n)), caption = "Survival rate by Age/Cabin missingness combinations")
+```
+
+```{r}
+#| label: rq3-sensitivity
+# Simple median imputation by Title+Pclass for Age and re-run RQ2 core terms
+age_by_grp <- train_fe %>% group_by(title, pclass) %>% summarize(med_age = median(age, na.rm = TRUE), .groups = "drop")
+train_imp <- train_fe %>%
+  left_join(age_by_grp, by = c("title","pclass")) %>%
+  mutate(age_imp = if_else(is.na(age), med_age, age), child_imp = age_imp < 16)
+
+mC_imp <- glm(
+  survived ~ sex * child_imp * is_alone + pclass + title + fare_log1p + embarked,
+  data = train_imp,
+  family = binomial()
+)
+
+bind_rows(
+  as_or_table(mC)  %>% mutate(model = "Complete-case"),
+  as_or_table(mC_imp) %>% mutate(model = "Median-imputed")
+) %>%
+  filter(str_detect(term, "sex:|child|is_alone")) %>%
+  select(model, term, OR, `2.5%`, `97.5%`) %>%
+  arrange(model) %>%
+  kable(caption = "Sensitivity: key interaction terms under complete-case vs median-imputed Age")
+```
+
+Interpretation: If missingness is related to class/embarkation and predictive of survival, naive complete-case analyses may be biased. Similar key effects across complete-case and median-imputed analyses suggest robustness; divergence indicates sensitivity to missing-data assumptions.
+
+# Appendix: session info
+
+```{r}
+#| label: session-info
+sessionInfo()
+```
