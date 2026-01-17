@@ -86,17 +86,20 @@ Example pattern:
 - and the corresponding `.html`
 
 ### 3) Render the output (and enforce correctness)
-- Render the report to HTML.
+- **Make Sure** Render the report to HTML.
 - The render **must** complete with zero errors.
 - If the render fails:
   - fix the underlying cause (packages, code, paths, chunk options, assumptions)
   - re-render until it compiles cleanly
 - Treat the rendered HTML as the “source of truth” for what a reader will see.
 
-### 3) Version control 
+### 4) Check if both .qmd and .html is present
+- If any of the files is missing, repeat step 2 and step 3
+- **ONLY WHEN** both files are present, proceed to step 5
+
+### 5) Version control 
 - Stage changes for both source and rendered output (as required).
-- Commit with an iteration-tagged message 
 - Push commits to the working branch.
 
-### 4) **Make Sure** Create a pull request 
+### 6) **Make Sure** Create a pull request 
 - With the report compiled, create a pull request to merge changes into `main` using gh pr create (provide title/body in the command or via flags).
