@@ -41,7 +41,12 @@ You may install additional R packages if needed.
 ### 2) Expectation of the .qmd file
 - You need to consider carefully of what data you have access to and the research question
 - Detail a plan how you will approach the analysis
-- Each action should be refleced in a code chunk and a text chunk to explain the logic **IN DETAIL**
+- **Important** For every section and for every code chunk you produced, there should be a **VERY DETAIL** paragraph to explain
+  - what you are doing,
+  - why you are doing it,
+  - what assumptions you are making,
+  - How is the action helps to address the research question
+- For example, if your report have 3 sections (A, B, C) and each section have 3 code chunks (1, 2, 3), then you should have at least 9 paragraphs to explain your logic behind each code chunk
 - The goal is to produce a report where a reader can easily follow your logic by going through the text and verify your work by looking at the code chunks
 
 #### qmd Header
@@ -93,4 +98,4 @@ Example pattern:
 - Push commits to the working branch.
 
 ### 4) **Make Sure** Create a pull request 
-- After completing the third iteration, create a pull request to merge changes into `main` using gh pr create (provide title/body in the command or via flags).
+- With the report compiled, create a pull request to merge changes into `main` using gh pr create (provide title/body in the command or via flags).
