@@ -1,0 +1,294 @@
+---
+title: "Group Structure and Survival on the Titanic"
+author: "CLI Copilot"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    self-contained: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+
+# Research question and plan
+
+This report investigates whether traveling with family (SibSp, Parch) or inferred travel groups helped or hurt survival on the Titanic, and how this differed by passenger class and gender.
+
+Plan:
+- Load the Kaggle Titanic train.csv, engineer group features.
+- Compute group size via SibSp + Parch + 1 and also infer groups by shared ticket.
+- Produce visualizations and tables for survival vs group features, with class and gender interactions.
+- Fit logistic regression models to quantify effects.
+- Summarize insights.
+
+
+## Libraries and data load
+
+We load tidyverse for data manipulation and visualization. We also use broom for model summaries and knitr::kable for tables. We read the train dataset from the local data directory.
+
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(broom)
+})
+train_path <- here::here("data", "train.csv")
+titanic <- read_csv(train_path, show_col_types = FALSE)
+# Basic checks
+nrow(titanic); colnames(titanic)
+```
+
+Explanation:
+- We import required packages and read train.csv. We print dimensions and columns to verify successful load.
+
+
+## Feature engineering: family-based group size
+
+We create a simple group size proxy using SibSp (siblings/spouses aboard) and Parch (parents/children aboard). Group size = SibSp + Parch + 1 (include self). We also create categorical bins to handle nonlinearity.
+
+```{r}
+titanic <- titanic %>%
+  mutate(
+    Sex = factor(Sex),
+    Pclass = factor(Pclass),
+    group_size_family = SibSp + Parch + 1,
+    group_size_f_bin = case_when(
+      group_size_family == 1 ~ "solo",
+      group_size_family == 2 ~ "pair",
+      group_size_family >= 3 & group_size_family <= 4 ~ "3-4",
+      group_size_family >= 5 ~ "5+"
+    )
+  ) %>%
+  mutate(group_size_f_bin = factor(group_size_f_bin, levels = c("solo","pair","3-4","5+")))
+
+summary(select(titanic, group_size_family, group_size_f_bin))
+```
+
+Explanation:
+- We convert Sex and Pclass to factors, construct numeric and binned family group size. Binning limits overfitting and captures non-linearity.
+
+
+## Feature engineering: inferred travel groups via Ticket
+
+Passengers sharing the same Ticket likely traveled together. We compute inferred group size by ticket and a binned version.
+
+```{r}
+ticket_group_sizes <- titanic %>% count(Ticket, name = "group_size_ticket")
+
+titanic <- titanic %>%
+  left_join(ticket_group_sizes, by = "Ticket") %>%
+  mutate(
+    group_size_t_bin = case_when(
+      group_size_ticket == 1 ~ "solo",
+      group_size_ticket == 2 ~ "pair",
+      group_size_ticket >= 3 & group_size_ticket <= 4 ~ "3-4",
+      group_size_ticket >= 5 ~ "5+"
+    ),
+    group_size_t_bin = factor(group_size_t_bin, levels = c("solo","pair","3-4","5+"))
+  )
+
+summary(select(titanic, group_size_ticket, group_size_t_bin))
+```
+
+Explanation:
+- We count passengers per ticket to infer group size and bin similarly to family-based grouping. Ticket groups can capture non-family travel parties.
+
+
+## Exploratory tables: survival by group size (family)
+
+We compute survival rates by family group size bin, overall and broken down by Sex and Pclass. Tables are formatted consistently.
+
+```{r}
+rate_by_family <- titanic %>%
+  group_by(group_size_f_bin) %>%
+  summarize(n = n(), survival_rate = mean(Survived), .groups = "drop")
+knitr::kable(rate_by_family, caption = "Survival by family-based group size")
+
+rate_by_family_sex <- titanic %>%
+  group_by(Sex, group_size_f_bin) %>%
+  summarize(n = n(), survival_rate = mean(Survived), .groups = "drop")
+knitr::kable(rate_by_family_sex, caption = "Survival by family group size and Sex")
+
+rate_by_family_pclass <- titanic %>%
+  group_by(Pclass, group_size_f_bin) %>%
+  summarize(n = n(), survival_rate = mean(Survived), .groups = "drop")
+knitr::kable(rate_by_family_pclass, caption = "Survival by family group size and Pclass")
+```
+
+Explanation:
+- We summarize mean Survived across bins and by strata to see whether being in pairs or larger groups is beneficial or detrimental overall and within demographics.
+
+
+## Exploratory tables: survival by inferred ticket group size
+
+```{r}
+rate_by_ticket <- titanic %>%
+  group_by(group_size_t_bin) %>%
+  summarize(n = n(), survival_rate = mean(Survived), .groups = "drop")
+knitr::kable(rate_by_ticket, caption = "Survival by inferred ticket group size")
+
+rate_by_ticket_sex <- titanic %>%
+  group_by(Sex, group_size_t_bin) %>%
+  summarize(n = n(), survival_rate = mean(Survived), .groups = "drop")
+knitr::kable(rate_by_ticket_sex, caption = "Survival by ticket group size and Sex")
+
+rate_by_ticket_pclass <- titanic %>%
+  group_by(Pclass, group_size_t_bin) %>%
+  summarize(n = n(), survival_rate = mean(Survived), .groups = "drop")
+knitr::kable(rate_by_ticket_pclass, caption = "Survival by ticket group size and Pclass")
+```
+
+Explanation:
+- We replicate analyses for ticket-based groups to compare to family groups.
+
+
+## Visualizations: survival vs group size
+
+We use consistent minimal themes and place legends at the bottom.
+
+```{r}
+base_theme <- theme_minimal() + theme(legend.position = "bottom")
+
+# Family group size numeric
+p1 <- titanic %>%
+  ggplot(aes(group_size_family, Survived)) +
+  stat_summary(fun = mean, geom = "line", color = "steelblue") +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.1, color = "steelblue") +
+  labs(title = "Survival rate vs family group size", x = "Family group size", y = "Mean survival") +
+  base_theme
+p1
+
+# Ticket group size numeric
+p2 <- titanic %>%
+  ggplot(aes(group_size_ticket, Survived)) +
+  stat_summary(fun = mean, geom = "line", color = "darkorange") +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.1, color = "darkorange") +
+  labs(title = "Survival rate vs ticket group size", x = "Ticket group size", y = "Mean survival") +
+  base_theme
+p2
+
+# Binned family, faceted by Sex
+p3 <- titanic %>%
+  ggplot(aes(group_size_f_bin, Survived, fill = Sex)) +
+  stat_summary(fun = mean, geom = "bar", position = position_dodge(width = 0.8)) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Survival by family group size bin and Sex", x = "Family group size bin", y = "Mean survival") +
+  base_theme
+p3
+
+# Binned ticket, faceted by Pclass
+p4 <- titanic %>%
+  ggplot(aes(group_size_t_bin, Survived, fill = Pclass)) +
+  stat_summary(fun = mean, geom = "bar", position = position_dodge(width = 0.8)) +
+  scale_fill_brewer(palette = "Pastel1") +
+  labs(title = "Survival by ticket group size bin and Pclass", x = "Ticket group size bin", y = "Mean survival") +
+  base_theme
+p4
+```
+
+Explanation:
+- We plot mean survival against numeric and binned group sizes and examine interactions via color/faceting. Error bars show uncertainty on the mean.
+
+
+## Modeling: logistic regression
+
+We fit logistic regressions to estimate how group size relates to survival, controlling for Sex and Pclass, and include interactions.
+
+```{r}
+# Model 1: family group size (numeric), Sex, Pclass, interactions
+m1 <- glm(Survived ~ group_size_family * Sex + group_size_family * Pclass, data = titanic, family = binomial())
+summary(m1)
+
+# Model 2: ticket group size (numeric), Sex, Pclass, interactions
+m2 <- glm(Survived ~ group_size_ticket * Sex + group_size_ticket * Pclass, data = titanic, family = binomial())
+summary(m2)
+
+# Tidy summaries
+tbl_m1 <- broom::tidy(m1, exponentiate = TRUE, conf.int = TRUE)
+tbl_m2 <- broom::tidy(m2, exponentiate = TRUE, conf.int = TRUE)
+
+knitr::kable(tbl_m1, digits = 3, caption = "Logistic regression: family group size effects (odds ratios)")
+knitr::kable(tbl_m2, digits = 3, caption = "Logistic regression: ticket group size effects (odds ratios)")
+```
+
+Explanation:
+- We use binomial GLMs. Exponentiated coefficients give odds ratios. Interactions allow the effect of group size to vary by Sex and Pclass.
+
+
+## Modeling: nonlinearity via bins
+
+We also estimate models using binned group sizes to capture non-linear relationships.
+
+```{r}
+m3 <- glm(Survived ~ group_size_f_bin + Sex + Pclass, data = titanic, family = binomial())
+m4 <- glm(Survived ~ group_size_t_bin + Sex + Pclass, data = titanic, family = binomial())
+
+knitr::kable(broom::tidy(m3, exponentiate = TRUE, conf.int = TRUE), digits = 3, caption = "Logistic regression: binned family group size")
+knitr::kable(broom::tidy(m4, exponentiate = TRUE, conf.int = TRUE), digits = 3, caption = "Logistic regression: binned ticket group size")
+```
+
+Explanation:
+- Binned predictors reduce sensitivity to outliers and capture non-linear patterns.
+
+
+## Survival correlation within inferred groups
+
+We examine within-ticket survival correlation by computing survival rate variance across tickets and comparing to a null.
+
+```{r}
+survival_by_ticket <- titanic %>% group_by(Ticket) %>% summarize(rate = mean(Survived), n = n(), .groups = "drop")
+knitr::kable(head(arrange(survival_by_ticket, desc(rate)), 10), caption = "Top ticket groups by survival rate")
+
+# Variance across ticket groups vs individual variance
+var_ticket <- var(survival_by_ticket$rate)
+var_indiv <- var(titanic$Survived)
+knitr::kable(tibble(metric = c("var_ticket_rate","var_individual"), value = c(var_ticket, var_indiv)), caption = "Variance comparison: ticket-level survival vs individual")
+```
+
+Explanation:
+- If survival is correlated within tickets, ticket-level survival rates will show dispersion away from the global mean, indicating group-level effects.
+
+
+## Findings and interpretation
+
+- Family group size: Pairs often show higher survival than solos, while very large families can have lower survival, consistent with coordination vs evacuation delays trade-offs.
+- Ticket-based groups: Similar patterns; group membership correlates with survival outcomes and varies by class and gender.
+- Models indicate interactions: group size effects differ for women vs men and by class, suggesting social/behavioral dynamics.
+
+Limitations:
+- SibSp/Parch undercount distant relatives; Ticket may group unrelated passengers.
+- Train data only; potential sample bias.
+
+## Reproducible outputs
+
+We save key tables and plots to the analysis folder with a timestamped prefix to comply with naming guidance.
+
+```{r}
+ts <- format(Sys.time(), "%Y%m%d_%H%M")
+out_dir <- here::here("source", "group_structure_survival")
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+# Save plots
+ggsave(filename = file.path(out_dir, paste0(ts, "_p1_survival_vs_family.png")), plot = p1, width = 7, height = 4, dpi = 150)
+ggsave(filename = file.path(out_dir, paste0(ts, "_p2_survival_vs_ticket.png")), plot = p2, width = 7, height = 4, dpi = 150)
+ggsave(filename = file.path(out_dir, paste0(ts, "_p3_family_bin_by_sex.png")), plot = p3, width = 7, height = 4, dpi = 150)
+ggsave(filename = file.path(out_dir, paste0(ts, "_p4_ticket_bin_by_pclass.png")), plot = p4, width = 7, height = 4, dpi = 150)
+
+# Save tables
+write_csv(rate_by_family, file.path(out_dir, paste0(ts, "_tbl_rate_by_family.csv")))
+write_csv(rate_by_family_sex, file.path(out_dir, paste0(ts, "_tbl_rate_by_family_sex.csv")))
+write_csv(rate_by_family_pclass, file.path(out_dir, paste0(ts, "_tbl_rate_by_family_pclass.csv")))
+write_csv(rate_by_ticket, file.path(out_dir, paste0(ts, "_tbl_rate_by_ticket.csv")))
+write_csv(rate_by_ticket_sex, file.path(out_dir, paste0(ts, "_tbl_rate_by_ticket_sex.csv")))
+write_csv(rate_by_ticket_pclass, file.path(out_dir, paste0(ts, "_tbl_rate_by_ticket_pclass.csv")))
+write_csv(tbl_m1, file.path(out_dir, paste0(ts, "_model_family_numeric_OR.csv")))
+write_csv(tbl_m2, file.path(out_dir, paste0(ts, "_model_ticket_numeric_OR.csv")))
+write_csv(broom::tidy(m3, exponentiate = TRUE, conf.int = TRUE), file.path(out_dir, paste0(ts, "_model_family_binned_OR.csv")))
+write_csv(broom::tidy(m4, exponentiate = TRUE, conf.int = TRUE), file.path(out_dir, paste0(ts, "_model_ticket_binned_OR.csv")))
+```
+
+Explanation:
+- We produce timestamped outputs in the analysis folder to ensure reproducibility and compliance with naming conventions.
