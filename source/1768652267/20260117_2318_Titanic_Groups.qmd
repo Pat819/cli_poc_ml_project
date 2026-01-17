@@ -31,9 +31,10 @@ library(glmnet)
 library(modelr)
 library(knitr)
 library(ggthemes)
+library(here)
 
-# Read data
-train <- read_csv("data/train.csv")
+# Read data using project root path
+train <- read_csv(here::here("data","train.csv"))
 
 # Basic cleaning: create key features
 train <- train %>%
