@@ -1,0 +1,260 @@
+---
+title: "Titanic: Deck, Fare, and Embarkation Effects Beyond Class"
+author: "CLI Copilot"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    self-contained: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Plan and Data
+
+We address three questions using the Titanic dataset in `data/train.csv`:
+
+1) Does cabin and deck information add signal beyond class and fare?
+2) Is fare a proxy for wealth within class or does it carry independent survival signal?
+3) Does the port of embarkation change survival patterns after controlling for who boards there?
+
+We use tidyverse and ggplot2; tables are rendered with knitr::kable; a consistent minimalist theme is applied.
+
+```{r}
+library(tidyverse)
+library(broom)
+library(rsample)
+library(yardstick)
+library(knitr)
+library(ggthemes)
+library(here)
+
+train <- read_csv(here::here("data","train.csv"))
+
+train <- train %>%
+  mutate(
+    Sex = factor(Sex),
+    Pclass = factor(Pclass),
+    Survived = factor(Survived, levels = c(0,1), labels = c("No","Yes")),
+    # Impute Age using median within Sex × Pclass; fallback to global median
+    Age = ifelse(is.na(Age), ave(Age, Sex, Pclass, FUN = function(x){
+      if(all(is.na(x))) median(train$Age, na.rm = TRUE) else median(x, na.rm = TRUE)
+    }), Age),
+    Child = as.integer(Age < 16),
+    FamilySize = SibSp + Parch + 1,
+    MissingCabin = is.na(Cabin),
+    Deck = ifelse(MissingCabin, "Unknown", substr(Cabin, 1, 1))
+  ) %>%
+  mutate(
+    Deck = ifelse(Deck %in% c("A","B","C","D","E","F","G"), Deck, "Unknown"),
+    Deck = factor(Deck, levels = c("A","B","C","D","E","F","G","Unknown")),
+    MissingCabin = factor(MissingCabin, levels = c(FALSE, TRUE), labels = c("Known","Missing"))
+  )
+
+theme_base <- theme_minimal(base_size = 12) + theme(legend.position = "bottom")
+```
+
+# 1) Deck and Cabin signal beyond class and fare
+
+## EDA: Extract Deck and compare survival by Deck and MissingCabin, stratified by Pclass
+
+We derive Deck as the first letter of Cabin and consider MissingCabin as a separate indicator. We examine survival rates by Deck and MissingCabin within each passenger class to test whether deck location adds signal after conditioning on class composition.
+
+```{r}
+eda_deck <- train %>%
+  group_by(Pclass, Deck) %>%
+  summarize(n = n(), surv_rate = mean(Survived == "Yes"), .groups = "drop")
+
+ggplot(eda_deck, aes(Deck, surv_rate, fill = Deck)) +
+  geom_col() +
+  facet_wrap(~ Pclass, nrow = 1) +
+  labs(title = "Survival by Deck within Class", x = "Deck", y = "Survival rate") +
+  theme_base
+```
+
+```{r}
+eda_cabin_missing <- train %>%
+  group_by(Pclass, MissingCabin) %>%
+  summarize(n = n(), surv_rate = mean(Survived == "Yes"), .groups = "drop")
+
+ggplot(eda_cabin_missing, aes(MissingCabin, surv_rate, fill = MissingCabin)) +
+  geom_col(position = position_dodge(width = 0.8)) +
+  facet_wrap(~ Pclass, nrow = 1) +
+  labs(title = "Survival by Cabin Missingness within Class", x = "Cabin info", y = "Survival rate") +
+  theme_base
+```
+
+## Model: Add Deck and MissingCabin; cross-validation gain and importance
+
+We compare a baseline model using Sex, Pclass, Age, and Fare with an augmented model that includes Deck and MissingCabin. Five-fold CV reports accuracy and ROC AUC; we inspect coefficients to assess the incremental contribution.
+
+```{r}
+set.seed(42)
+folds <- vfold_cv(train, v = 5, strata = Survived)
+
+cv_metrics <- function(formula){
+  map_dfr(folds$splits, function(s){
+    tr <- analysis(s); te <- assessment(s)
+    # Ensure consistent factor levels across folds to avoid new-level errors
+    tr <- tr %>% mutate(
+      Deck = factor(Deck, levels = levels(train$Deck)),
+      MissingCabin = factor(MissingCabin, levels = levels(train$MissingCabin)),
+      Embarked = factor(Embarked, levels = levels(train$Embarked))
+    )
+    te <- te %>% mutate(
+      Deck = factor(Deck, levels = levels(train$Deck)),
+      MissingCabin = factor(MissingCabin, levels = levels(train$MissingCabin)),
+      Embarked = factor(Embarked, levels = levels(train$Embarked))
+    )
+    fit <- glm(formula, data = tr, family = binomial())
+    # Map unseen factor levels in te to a valid baseline level to avoid xlevels errors
+    te <- te %>% mutate(
+      Deck = {
+        lv <- levels(tr$Deck); d <- as.character(Deck); d[!d %in% lv] <- lv[1]; factor(d, levels = lv)
+      },
+      MissingCabin = {
+        lv <- levels(tr$MissingCabin); mc <- as.character(MissingCabin); mc[!mc %in% lv] <- lv[1]; factor(mc, levels = lv)
+      },
+      Embarked = {
+        lv <- levels(tr$Embarked); e <- as.character(Embarked); e[!e %in% lv] <- lv[1]; factor(e, levels = lv)
+      }
+    )
+    prob <- predict(fit, newdata = te, type = "response")
+    pred <- factor(ifelse(prob > 0.5, "Yes", "No"), levels = c("No","Yes"))
+    tibble(
+      accuracy = yardstick::accuracy_vec(te$Survived, pred),
+      roc_auc = yardstick::roc_auc_vec(te$Survived, prob, event_level = "second")
+    )
+  }) %>% summarize(across(everything(), mean))
+}
+
+f_baseline <- Survived ~ Sex + Pclass + Age + Fare
+f_deck     <- Survived ~ Sex + Pclass + Age + Fare + Deck + MissingCabin
+
+m_baseline <- cv_metrics(f_baseline)
+m_deck     <- cv_metrics(f_deck)
+
+bind_rows(
+  m_baseline %>% mutate(model = "Baseline"),
+  m_deck %>% mutate(model = "+Deck+MissingCabin")
+) %>% select(model, accuracy, roc_auc) %>% knitr::kable(digits = 3)
+```
+
+```{r}
+fit_full <- glm(f_deck, data = train, family = binomial())
+tidy(fit_full, exponentiate = TRUE, conf.int = TRUE) %>%
+  arrange(desc(estimate)) %>%
+  knitr::kable(digits = 3, caption = "Odds ratios (augmented model)")
+```
+
+# 2) Fare: proxy within class or independent signal
+
+## EDA: Survival vs Fare within each Pclass; compare fare quantiles per class
+
+We visualize survival rate against Fare within each class and compute fare quantiles to understand within-class variation.
+
+```{r}
+train <- train %>% mutate(LogFare = log1p(Fare))
+
+# Smooth survival vs Fare within class
+eda_fare <- train %>%
+  group_by(Pclass) %>%
+  summarize(q = list(quantile(Fare, probs = seq(0,1,0.25), na.rm = TRUE)), .groups = "drop")
+
+knitr::kable(unnest_wider(eda_fare, q), digits = 2, caption = "Fare quantiles by class")
+```
+
+```{r}
+# Bin fare within class into quantiles
+train <- train %>% group_by(Pclass) %>%
+  mutate(FareQuantileWithinClass = ntile(Fare, 4)) %>% ungroup()
+
+eda_fare_surv <- train %>%
+  group_by(Pclass, FareQuantileWithinClass) %>%
+  summarize(n = n(), surv_rate = mean(Survived == "Yes"), .groups = "drop")
+
+ggplot(eda_fare_surv, aes(factor(FareQuantileWithinClass), surv_rate, fill = factor(FareQuantileWithinClass))) +
+  geom_col() + facet_wrap(~ Pclass, nrow = 1) +
+  labs(title = "Survival vs Fare quantile within class", x = "Fare quantile (within class)", y = "Survival rate") +
+  theme_base
+```
+
+## Model: Incremental value over class alone using LogFare and FareQuantileWithinClass
+
+We test whether Fare carries signal beyond class using both continuous LogFare and categorical FareQuantileWithinClass.
+
+```{r}
+set.seed(42)
+folds <- vfold_cv(train, v = 5, strata = Survived)
+
+m_class_only <- cv_metrics(Survived ~ Pclass)
+m_logfare    <- cv_metrics(Survived ~ Pclass + LogFare)
+m_fareq      <- cv_metrics(Survived ~ Pclass + factor(FareQuantileWithinClass))
+
+bind_rows(
+  m_class_only %>% mutate(model = "Class only"),
+  m_logfare %>% mutate(model = "+LogFare"),
+  m_fareq %>% mutate(model = "+FareQuantileWithinClass")
+) %>% select(model, accuracy, roc_auc) %>% knitr::kable(digits = 3)
+```
+
+# 3) Embarkation effects after controlling composition
+
+## EDA: Survival by Embarked; then condition on Pclass and Sex
+
+We examine survival by port of embarkation overall and within strata of Pclass and Sex to identify composition vs within-port effects.
+
+```{r}
+train <- train %>% mutate(Embarked = factor(Embarked))
+
+eda_embarked <- train %>% group_by(Embarked) %>%
+  summarize(n = n(), surv_rate = mean(Survived == "Yes"), .groups = "drop")
+
+ggplot(eda_embarked, aes(Embarked, surv_rate, fill = Embarked)) +
+  geom_col() + labs(title = "Survival by Embarked", x = "Embarked", y = "Survival rate") + theme_base
+```
+
+```{r}
+eda_embarked_strata <- train %>% group_by(Embarked, Pclass, Sex) %>%
+  summarize(n = n(), surv_rate = mean(Survived == "Yes"), .groups = "drop")
+
+ggplot(eda_embarked_strata, aes(Pclass, surv_rate, fill = Sex)) +
+  geom_col(position = position_dodge(width = 0.8)) +
+  facet_wrap(~ Embarked, nrow = 1) +
+  labs(title = "Survival by Pclass and Sex within Embarked", x = "Pclass", y = "Survival rate") +
+  theme_base
+```
+
+## Model: Add Embarked and Embarked*Pclass; compare CV and inspect coefficients
+
+```{r}
+set.seed(42)
+folds <- vfold_cv(train, v = 5, strata = Survived)
+
+m_no_emb <- cv_metrics(Survived ~ Sex + Pclass + Age + Fare)
+m_with_emb <- cv_metrics(Survived ~ Sex + Pclass + Age + Fare + Embarked + Embarked:Pclass)
+
+bind_rows(
+  m_no_emb %>% mutate(model = "No Embarked"),
+  m_with_emb %>% mutate(model = "+Embarked + Embarked:Pclass")
+) %>% select(model, accuracy, roc_auc) %>% knitr::kable(digits = 3)
+```
+
+```{r}
+fit_emb_full <- glm(Survived ~ Sex + Pclass + Age + Fare + Embarked + Embarked:Pclass,
+                    data = train, family = binomial())
+
+tidy(fit_emb_full, exponentiate = TRUE, conf.int = TRUE) %>%
+  arrange(desc(estimate)) %>%
+  knitr::kable(digits = 3, caption = "Odds ratios with Embarked and interaction")
+```
+
+# Notes
+
+- Age imputation minimizes leakage by using strata without outcome.
+- Deck is derived from Cabin first letter; MissingCabin captures information absence which may correlate with class and survival processes.
+- Fare is log-transformed to reduce skew; quantiles within class isolate within-class price variation.
+- Embarked effects are tested with interaction to separate composition from port-specific processes.
