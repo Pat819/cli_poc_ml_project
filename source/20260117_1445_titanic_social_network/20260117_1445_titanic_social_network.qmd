@@ -1,0 +1,351 @@
+---
+title: "Hidden social structure and survival in Titanic: a network-based analysis"
+author: "CLI Copilot"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    self-contained: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Research question and plan
+
+This report addresses: What hidden social structure can be inferred from who traveled together, and did that structure influence survival?
+
+Plan of attack:
+- Infer travel groups and a passenger network using shared Ticket, Surname, Cabin, and Embarked as linkage signals.
+- Engineer network-based features such as group size, solo indicator, class mix within group, centrality, and presence of children or high-fare anchors.
+- Test whether network position adds explanatory power by comparing a baseline survival model to one augmented with network features.
+
+We use R with tidyverse and igraph, and we ensure the analysis compiles reproducibly.
+
+# A) Setup
+
+We load packages (installing any that are missing) and set a seed for reproducibility.
+
+```{r}
+# Install and load required packages
+required_pkgs <- c("tidyverse", "janitor", "broom", "pROC", "igraph")
+missing <- setdiff(required_pkgs, rownames(installed.packages()))
+if (length(missing) > 0) install.packages(missing, repos = "https://cloud.r-project.org")
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(janitor)
+  library(broom)
+  library(pROC)
+  library(igraph)
+})
+
+set.seed(20260117)
+```
+
+Explanation: We explicitly manage dependencies to guarantee render success. We prefer igraph for network computation to minimize extra dependencies and complexity, ensuring stable centrality and component calculations. Setting a seed makes any procedures involving randomness reproducible (though this analysis is largely deterministic).
+
+# B) Data loading and initial understanding
+
+We load the training and test CSVs provided in data/. The primary modeling will be on the training data where Survived is observed.
+
+```{r}
+# Paths relative to this qmd file's folder
+train_path <- "../../data/train.csv"
+test_path  <- "../../data/test.csv"
+
+train_raw <- readr::read_csv(train_path, show_col_types = FALSE) %>% clean_names()
+test_raw  <- readr::read_csv(test_path,  show_col_types = FALSE) %>% clean_names()
+
+list(
+  train_dim = dim(train_raw),
+  test_dim  = dim(test_raw),
+  train_head = head(train_raw, 3)
+)
+```
+
+Explanation: We load both datasets to understand the structure, but only train has the target Survived. Cleaning names with janitor provides consistent snake_case column names which simplifies tidyverse pipelines. The head shows typical fields (pclass, name, sex, age, sib_sp, parch, ticket, fare, cabin, embarked).
+
+# C) Feature engineering: demographic baseline and parsing names
+
+We will prepare a baseline feature set and parse names to extract surname and title. We also create a pragmatic age imputation to avoid dropping rows.
+
+```{r}
+# Helper: extract surname (before comma) and title (between comma and period)
+extract_surname <- function(name) {
+  # Expect pattern: "Surname, Title. Given names"
+  sapply(strsplit(name, ","), function(x) trimws(x[1]))
+}
+extract_title <- function(name) {
+  # titles like Mr, Mrs, Miss, Master, etc.
+  sub("\\.", "", trimws(sapply(strsplit(name, ","), function(x) {
+    if (length(x) >= 2) {
+      # Take token(s) before the dot in the second part
+      sub("^ *([A-Za-z]+).*", "\\1", x[2])
+    } else {
+      NA_character_
+    }
+  })))
+}
+
+# Prepare baseline features and imputations on train only
+train_base <- train_raw %>%
+  mutate(
+    surname = extract_surname(name),
+    title   = extract_title(name),
+    cabin_clean = if_else(is.na(cabin) | cabin == "", NA_character_, cabin),
+    cabin_code  = if_else(!is.na(cabin_clean), substr(cabin_clean, 1, 1), NA_character_),
+    embarked    = factor(embarked),
+    sex         = factor(sex),
+    pclass      = as.integer(pclass)
+  )
+
+# Impute age via group medians to retain all rows
+age_medians <- train_base %>%
+  group_by(sex, pclass) %>%
+  summarize(age_med = median(age, na.rm = TRUE), .groups = "drop")
+
+train_base <- train_base %>%
+  left_join(age_medians, by = c("sex", "pclass")) %>%
+  mutate(age_imp = if_else(is.na(age), age_med, age)) %>%
+  select(-age_med)
+
+# Ensure Fare missing (if any) filled with median to stabilize models
+fare_med <- median(train_base$fare, na.rm = TRUE)
+train_base <- train_base %>% mutate(fare_imp = if_else(is.na(fare), fare_med, fare))
+
+# Quick check
+skim <- train_base %>% summarize(
+  n = n(),
+  na_age = sum(is.na(age)),
+  na_age_imp = sum(is.na(age_imp)),
+  na_fare = sum(is.na(fare)),
+  na_fare_imp = sum(is.na(fare_imp))
+)
+skim
+```
+
+Explanation: We derive surname and title to enable household-like linking and potential child inference. Age often has missing values; we impute age using the median within sex × class strata, a transparent and robust approach that avoids leakage from more complex models and keeps all observations. Fare is rarely missing; we fill any gaps with the global median to prevent glm issues.
+
+# D) Inferring co-travel associations and constructing the passenger network
+
+We infer undirected edges between passengers using three independent signals: shared ticket (strong), shared cabin (strong), and shared surname + embarked + pclass (family/household proxy). We then combine these edges, build a graph, and compute component membership and standard centrality metrics.
+
+```{r}
+# Utility to create all unique pairs within each group id
+pairs_from_group <- function(df, id_col) {
+  df %>%
+    filter(!is.na(.data[[id_col]]), .data[[id_col]] != "") %>%
+    group_by(.data[[id_col]]) %>%
+    filter(n() > 1) %>%
+    summarize(pairs = list(as.data.frame(t(combn(passenger_id, 2)))), .groups = "drop") %>%
+    unnest(pairs) %>%
+    rename(from = V1, to = V2) %>%
+    mutate(type = id_col)
+}
+
+# Edge sets
+edges_ticket <- train_base %>% pairs_from_group("ticket")
+edges_cabin  <- train_base %>% pairs_from_group("cabin_clean")
+
+# Family/household proxy: surname + embarked + pclass
+edges_surname <- train_base %>%
+  mutate(surname_key = if_else(is.na(embarked), NA_character_, paste(surname, embarked, pclass, sep = "|"))) %>%
+  pairs_from_group("surname_key") %>%
+  mutate(type = "surname_key")
+
+# Combine and simplify edge list (remove duplicates where same undirected pair appears)
+edges_all <- bind_rows(edges_ticket, edges_cabin, edges_surname) %>%
+  mutate(edge_id = paste(pmin(from, to), pmax(from, to), sep = "-")) %>%
+  distinct(edge_id, .keep_all = TRUE) %>%
+  select(from, to, type)
+
+# Build graph
+verts <- train_base %>% select(passenger_id)
+G <- graph_from_data_frame(d = edges_all, vertices = verts, directed = FALSE)
+
+# Component membership and sizes
+comp <- components(G)
+comp_membership <- comp$membership
+comp_sizes <- comp$csize
+
+# Centralities
+deg <- degree(G, mode = "all")
+btw <- betweenness(G, normalized = TRUE)
+# Eigenvector centrality may fail on disconnected; igraph handles per-component
+eig <- eigen_centrality(G)$vector
+
+# Assemble node-level network features
+net_df <- tibble(
+  passenger_id = as.integer(names(deg)),
+  group_id     = as.integer(comp_membership[as.character(passenger_id)]),
+  group_size   = as.integer(comp_sizes[group_id]),
+  degree       = as.numeric(deg),
+  betweenness  = as.numeric(btw),
+  eigen_c      = as.numeric(eig)
+)
+
+# Merge back network features
+train_net <- train_base %>% left_join(net_df, by = "passenger_id")
+
+# Group-level attributes requiring aggregation
+fare_q90 <- quantile(train_net$fare_imp, 0.90, na.rm = TRUE)
+
+group_attrs <- train_net %>%
+  group_by(group_id) %>%
+  summarize(
+    group_class_mix    = n_distinct(pclass),
+    group_has_child    = any(age_imp < 16, na.rm = TRUE),
+    group_has_highfare = any(fare_imp >= fare_q90, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+train_net <- train_net %>%
+  left_join(group_attrs, by = "group_id") %>%
+  mutate(
+    solo = group_size == 1,
+    # Replace NAs for isolated nodes (if any vertex not in edges) with defaults
+    group_size = if_else(is.na(group_size), 1L, group_size),
+    degree = if_else(is.na(degree), 0, degree),
+    betweenness = if_else(is.na(betweenness), 0, betweenness),
+    eigen_c = if_else(is.na(eigen_c), 0, eigen_c),
+    group_class_mix = if_else(is.na(group_class_mix), 1L, group_class_mix),
+    group_has_child = if_else(is.na(group_has_child), FALSE, group_has_child),
+    group_has_highfare = if_else(is.na(group_has_highfare), FALSE, group_has_highfare)
+  )
+
+list(
+  n_edges_total = nrow(edges_all),
+  n_components = length(unique(train_net$group_id)),
+  group_size_summary = summary(train_net$group_size)
+)
+```
+
+Explanation: We create edges from shared ticket and cabin, which are strong signals of co-travel, and from surname+embarked+pclass, which proxies likely family or household units. We combine edges and build an undirected graph. Component membership defines inferred travel groups; their sizes capture solo vs group travel. Degree, betweenness, and eigenvector centralities quantify a passenger's embeddedness. Group-level attributes like class mix, presence of children, and presence of high-fare passengers are calculated by aggregating within components. We guard against missing network metrics for isolated vertices.
+
+# E) Descriptive patterns: network features and survival
+
+We first examine how survival varies with group size and solo travel.
+
+```{r}
+# Survival by solo/group
+surv_by_solo <- train_net %>%
+  group_by(solo) %>%
+  summarize(survival_rate = mean(survived), n = n(), .groups = "drop")
+
+# Survival vs group size (capped for visualization)
+train_net <- train_net %>% mutate(group_size_capped = pmin(group_size, 8L))
+
+surv_by_gsize <- train_net %>%
+  group_by(group_size_capped) %>%
+  summarize(survival_rate = mean(survived), n = n(), .groups = "drop")
+
+list(surv_by_solo = surv_by_solo, surv_by_gsize = surv_by_gsize)
+```
+
+Explanation: We compute survival rates for solo travelers and by capped group size to avoid sparse tails. These summaries provide initial evidence about whether social embedding coincides with differential survival.
+
+```{r}
+# Visualizations
+p1 <- ggplot(surv_by_solo, aes(x = solo, y = survival_rate)) +
+  geom_col(fill = "#4C78A8") +
+  scale_x_discrete(labels = c("FALSE" = "With group", "TRUE" = "Solo")) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(title = "Survival rate by solo vs group travel",
+       x = "Travel mode",
+       y = "Survival rate") +
+  theme_minimal(base_size = 12) + theme(legend.position = "bottom")
+
+p2 <- ggplot(surv_by_gsize, aes(x = group_size_capped, y = survival_rate)) +
+  geom_line(color = "#F58518") + geom_point(color = "#F58518") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_x_continuous(breaks = 1:8) +
+  labs(title = "Survival rate by inferred group size (capped at 8)",
+       x = "Group size (capped)", y = "Survival rate") +
+  theme_minimal(base_size = 12) + theme(legend.position = "bottom")
+
+p1
+p2
+```
+
+Explanation: The bar chart contrasts solo vs group survival. The line chart shows the relationship between increasing group size and survival. Minimalist themes and explicit labels are used for clarity and consistency.
+
+# F) Modeling survival: baseline vs network-augmented
+
+We estimate a baseline logistic regression using demographics and class, then add network features. We compare model fit, discrimination, and the statistical significance of network terms.
+
+```{r}
+# Prepare modeling frame
+model_df <- train_net %>%
+  transmute(
+    survived = factor(survived),
+    sex, embarked,
+    pclass = as.integer(pclass),
+    age_imp, fare_imp, sib_sp, parch,
+    # network features
+    group_size, solo, group_class_mix, group_has_child, group_has_highfare,
+    degree, betweenness, eigen_c
+  ) %>%
+  mutate(
+    survived = fct_relevel(survived, "0", "1")
+  )
+
+# Baseline model (no network features)
+m_base <- glm(survived ~ sex + pclass + age_imp + fare_imp + sib_sp + parch + embarked,
+              data = model_df, family = binomial())
+
+# Network-augmented model
+m_net <- glm(survived ~ sex + pclass + age_imp + fare_imp + sib_sp + parch + embarked +
+               group_size + solo + group_class_mix + group_has_child + group_has_highfare +
+               degree + betweenness + eigen_c,
+             data = model_df, family = binomial())
+
+# Compare models
+null_m <- glm(survived ~ 1, data = model_df, family = binomial())
+
+metrics <- tibble(
+  model = c("baseline", "network"),
+  AIC   = c(AIC(m_base), AIC(m_net)),
+  McFadden_R2 = c(1 - logLik(m_base)/logLik(null_m), 1 - logLik(m_net)/logLik(null_m))
+)
+
+# AUROC using the rows actually used in each model
+mf_base <- model.frame(m_base)
+mf_net  <- model.frame(m_net)
+roc_base <- pROC::roc(response = mf_base$survived, predictor = fitted(m_base))
+roc_net  <- pROC::roc(response = mf_net$survived,  predictor = fitted(m_net))
+aucs <- tibble(model = c("baseline", "network"), AUROC = c(as.numeric(roc_base$auc), as.numeric(roc_net$auc)))
+
+# Likelihood ratio test for nested models
+lr_test <- anova(m_base, m_net, test = "Chisq")
+
+list(metrics = metrics, aucs = aucs, lr_test = lr_test)
+```
+
+Explanation: The baseline includes sex, class, age, fare, family counts, and port of embarkation. The network model adds component size, solo status, class mix, and centrality measures, as well as indicators for children and high-fare travelers in the group. We compare AIC for parsimony, McFadden's pseudo-R^2 for explained variance, AUROC for discrimination, and perform a likelihood ratio test to assess whether added network features improve fit beyond chance.
+
+```{r}
+# Effect sizes for network features: odds ratios with 95% CI
+net_tidy <- tidy(m_net, conf.int = TRUE, exponentiate = TRUE) %>%
+  filter(term %in% c("group_size", "soloTRUE", "group_class_mix", "group_has_childTRUE", "group_has_highfareTRUE",
+                     "degree", "betweenness", "eigen_c")) %>%
+  arrange(desc(estimate))
+
+net_tidy
+```
+
+Explanation: We focus on the network-related coefficients from the augmented model, reporting odds ratios and confidence intervals to interpret direction and magnitude. Continuous centrality terms are on their raw scale; interpretation is per-unit change. If desired, one could standardize these predictors, but we keep raw units to remain faithful to the computed graph metrics.
+
+# G) Sensitivity checks (brief)
+
+Two minimalist checks help verify robustness:
+- Replace surname-based edges with a stricter criterion (e.g., require surname + embarked + identical ticket prefix) and re-compute to see if qualitative conclusions hold.
+- Remove eigenvector centrality and re-estimate; if inference is unchanged for group_size/solo, conclusions are robust to centrality specification.
+
+For brevity, we keep these as suggestions; the core finding hinges on whether network augmentation materially improves fit and discrimination.
+
+# H) Conclusion
+
+We inferred likely co-travel groups using shared ticket, cabin, and surname with embarkation and class. Network-derived features such as group size, solo travel, and centrality can be tested for association with survival. If the network-augmented model shows lower AIC, higher pseudo-R^2/AUROC, and a significant LR test versus the baseline, this indicates that social embedding contains additional explanatory signal for survival beyond demographics and class.
