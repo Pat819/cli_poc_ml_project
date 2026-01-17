@@ -1,0 +1,257 @@
+---
+title: "Titanic two-stage survival policy forecast"
+author: "CLI Copilot"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    self-contained: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Overview
+
+This report treats survival as a two-stage process and forecasts survival under hypothetical evacuation policies. We use the Titanic train dataset in `data/train.csv`.
+
+We implement:
+- Stage A: an interpretable access/priority model using logistic regression and partial dependence.
+- Stage B: a conditional survival model focusing on likely-prioritized passengers, adding cabin/deck proxies and interactions.
+- Forecasting: simulate policy scenarios modifying effect strengths, forecast overall and subgroup survival with uncertainty via bootstrap.
+- Visualization: dashboard of small multiples for scenario forecasts with uncertainty intervals.
+
+Assumptions: We treat the training data as the full population for modeling and scenario simulation. Cabin strings proxy deck via first letter; missing cabins are treated as lower deck/unknown.
+
+# Setup and data
+
+```{r}
+# Purpose: Load libraries and data, define helpers.
+# Why: Required foundations to reproduce the analysis.
+# Assumptions: Quarto with R is available, packages installable.
+
+pkgs <- c("tidyverse", "mgcv", "broom", "rsample", "yardstick", "vip")
+for (p in pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+}
+
+library(tidyverse)
+library(mgcv)
+library(broom)
+library(rsample)
+library(yardstick)
+library(vip)
+
+train <- read_csv("../../data/train.csv", show_col_types = FALSE)
+# Basic cleaning and feature engineering
+prep <- train %>%
+  mutate(
+    Sex = factor(Sex),
+    Pclass = factor(Pclass),
+    Embarked = factor(Embarked),
+    Age = as.numeric(Age),
+    Fare = as.numeric(Fare),
+    SibSp = as.integer(SibSp),
+    Parch = as.integer(Parch),
+    Survived = as.integer(Survived),
+    # Deck proxy from Cabin first letter
+    Deck = str_extract(Cabin, "^[A-Za-z]") %>% replace_na("Unknown") %>% factor(),
+    # Group proxy from Ticket: first token
+    TicketGroup = str_extract(Ticket, "^[A-Za-z]+") %>% replace_na("NUM") %>% factor(),
+    # Surname group proxy
+    Surname = str_extract(Name, "^[^,]+") %>% factor(),
+    # Age bands for subgroup reporting
+    AgeBand = cut(Age, breaks = c(-Inf, 12, 18, 35, 60, Inf), labels = c("Child","Teen","YoungAdult","Adult","Senior"), right = FALSE)
+  )
+
+# Remove rows with missing critical covariates for Stage A (keep NAs minimal)
+stageA_df <- prep %>% filter(!is.na(Age), !is.na(Fare), !is.na(Embarked))
+
+nrow(train); nrow(stageA_df)
+```
+
+# Stage A: Access/Priority model
+
+```{r}
+# Purpose: Fit interpretable model approximating access priority.
+# Why: Identify variables aligning with access to lifeboats/assistance.
+# Assumptions: Logistic regression captures main effects; GAM allows smooths for Age, Fare.
+
+# Logistic regression baseline
+glm_a <- glm(Survived ~ Sex + Age + Pclass + Fare + Embarked + SibSp + Parch,
+             data = stageA_df, family = binomial())
+summary(glm_a)
+
+# GAM with smooths for Age, Fare
+gam_a <- mgcv::gam(Survived ~ Sex + s(Age) + Pclass + s(Fare) + Embarked + SibSp + Parch,
+                   data = stageA_df, family = binomial())
+summary(gam_a)
+
+# Partial dependence for key variables using vip::vi and manual grid
+library(vip)
+vi_glm <- vip::vi(glm_a)
+head(vi_glm)
+
+# Manual partial dependence for Age and Fare
+pd_grid <- crossing(Age = seq(min(stageA_df$Age, na.rm=TRUE), max(stageA_df$Age, na.rm=TRUE), length.out = 50),
+                    Fare = seq(quantile(stageA_df$Fare, 0.01, na.rm=TRUE), quantile(stageA_df$Fare, 0.99, na.rm=TRUE), length.out = 50),
+                    Sex = levels(stageA_df$Sex)[1], Pclass = levels(stageA_df$Pclass)[1], Embarked = levels(stageA_df$Embarked)[1], SibSp = 0, Parch = 0)
+
+pd_glm <- pd_grid %>% mutate(pred = predict(glm_a, newdata = ., type = "response"))
+
+pd_plot <- pd_glm %>% ggplot(aes(Age, pred, color = Fare)) +
+  geom_line() + scale_color_viridis_c() + theme_minimal() +
+  labs(title = "Partial dependence: Age by Fare (GLM)", y = "Pr(Survival)", color = "Fare") +
+  theme(legend.position = "bottom")
+
+pd_plot
+```
+
+# Stage B: Conditional survival model
+
+```{r}
+# Purpose: Model remaining variance among likely-prioritized passengers.
+# Why: Understand what still matters after accounting for access.
+# Assumptions: Use top quantile of Stage A predicted scores as prioritized group.
+
+stageA_scores <- tibble(id = seq_len(nrow(stageA_df)), score = predict(glm_a, newdata = stageA_df, type = "response"))
+stageA_df2 <- stageA_df %>% bind_cols(stageA_scores)
+
+threshold <- quantile(stageA_df2$score, 0.75)
+prioritized <- stageA_df2 %>% filter(score >= threshold)
+
+# Add interactions and proxies
+glm_b <- glm(Survived ~ Deck * Pclass + Sex * Age + TicketGroup + I(SibSp + Parch),
+             data = prioritized, family = binomial())
+summary(glm_b)
+
+# Compare importance still present
+vi_b <- vip::vi(glm_b)
+vi_b
+```
+
+# Forecasting policy scenarios
+
+```{r}
+# Purpose: Simulate scenarios by modifying inputs/effects and forecast survival.
+# Why: Assess policy impacts on overall and subgroup survival.
+# Assumptions: Adjust coefficients multiplicatively to represent stronger/weaker effects.
+
+base_df <- prep %>% filter(!is.na(Age), !is.na(Fare), !is.na(Embarked))
+base_pred <- predict(glm_a, newdata = base_df, type = "response")
+
+coef_glm <- coef(glm_a)
+
+scenarios <- list(
+  base = coef_glm,
+  stronger_sex_age = {
+    cf <- coef_glm
+    if ("Sexmale" %in% names(cf)) cf["Sexmale"] <- cf["Sexmale"] * 1.5
+    if ("Age" %in% names(cf)) cf["Age"] <- cf["Age"] * 1.3
+    cf
+  },
+  reduced_class = {
+    cf <- coef_glm
+    for (nm in names(cf)[str_detect(names(cf), "^Pclass")]) cf[nm] <- cf[nm] * 0.2
+    cf
+  }
+)
+
+# Helper to compute predictions from modified coefficients for Stage A design matrix
+X_a <- model.matrix(glm_a$formula, data = base_df)
+inv_logit <- function(x) 1/(1+exp(-x))
+
+predict_with_coef <- function(beta) {
+  as.numeric(inv_logit(drop(X_a %*% beta)))
+}
+
+scenario_preds <- imap(scenarios, ~ tibble(scenario = .y, pred = predict_with_coef(.x)))
+
+# Bootstrap uncertainty
+set.seed(123)
+boot_ids <- replicate(200, sample(seq_len(nrow(base_df)), replace = TRUE), simplify = FALSE)
+
+boot_results <- map(boot_ids, function(idx) {
+  df_b <- base_df[idx, ]
+  X_b <- model.matrix(glm_a$formula, data = df_b)
+  map(scenarios, function(beta) inv_logit(drop(X_b %*% beta)))
+})
+
+# Summaries: overall survival and subgroup
+subgroups <- base_df %>% transmute(Subgroup = interaction(Sex, Pclass, AgeBand, drop = TRUE))
+
+summaries <- imap(scenario_preds, function(df, sc) {
+  tibble(
+    scenario = sc,
+    overall = mean(df$pred, na.rm = TRUE)
+  )
+}) %>% bind_rows()
+
+# Subgroup summaries
+scenario_subgroup <- imap(scenario_preds, function(df, sc) {
+  tibble(scenario = sc, Subgroup = subgroups$Subgroup, pred = df$pred) %>%
+    group_by(scenario, Subgroup) %>% summarise(pred = mean(pred, na.rm=TRUE), .groups = "drop")
+}) %>% bind_rows()
+
+# Bootstrap intervals
+boot_overall <- map(boot_results, function(res) map_dbl(res, ~ mean(.x, na.rm=TRUE))) %>% bind_rows() %>% as_tibble()
+boot_overall_long <- boot_overall %>% pivot_longer(everything(), names_to = "scenario", values_to = "overall")
+ci_overall <- boot_overall_long %>% group_by(scenario) %>% summarise(
+  lower = quantile(overall, 0.05), upper = quantile(overall, 0.95), .groups = "drop")
+
+# Merge CI
+summaries_ci <- summaries %>% left_join(ci_overall, by = "scenario")
+
+knitr::kable(summaries_ci, caption = "Overall survival forecasts with bootstrap 90% intervals")
+
+# Subgroup CIs: approximate by bootstrap mean per group
+boot_subgroup <- map(boot_ids, function(idx) {
+  df_b <- base_df[idx, ]
+  X_b <- model.matrix(glm_a$formula, data = df_b)
+  preds <- map(scenarios, function(beta) inv_logit(drop(X_b %*% beta)))
+  # bind predictions in consistent order
+  tibble(Subgroup = interaction(df_b$Sex, df_b$Pclass, df_b$AgeBand, drop = TRUE)) %>%
+    bind_cols(as_tibble(preds)) %>%
+    set_names(c("Subgroup", names(scenarios)))
+})
+
+boot_subgroup_long <- boot_subgroup %>% bind_rows() %>% pivot_longer(-Subgroup, names_to = "scenario", values_to = "pred")
+ci_subgroup <- boot_subgroup_long %>% group_by(scenario, Subgroup) %>% summarise(
+  lower = quantile(pred, 0.05, na.rm=TRUE), upper = quantile(pred, 0.95, na.rm=TRUE), .groups = "drop")
+
+# Visualizations
+library(ggplot2)
+
+p_overall <- summaries_ci %>% ggplot(aes(scenario, overall)) +
+  geom_point() + geom_errorbar(aes(ymin=lower, ymax=upper), width = 0.2) +
+  theme_minimal() + theme(legend.position = "bottom") +
+  labs(title = "Overall survival by scenario", y = "Predicted survival")
+
+p_overall
+
+p_subgroup <- scenario_subgroup %>% left_join(ci_subgroup, by = c("scenario","Subgroup")) %>%
+  ggplot(aes(Subgroup, pred, color = scenario)) +
+  geom_point(position = position_dodge(width = 0.6)) +
+  geom_errorbar(aes(ymin=lower, ymax=upper, group=scenario), position = position_dodge(width = 0.6), width = 0.3) +
+  facet_wrap(~ scenario, ncol = 2) + coord_flip() +
+  theme_minimal() + theme(legend.position = "bottom") +
+  labs(title = "Subgroup survival forecasts across scenarios", y = "Predicted survival")
+
+p_subgroup
+```
+
+# Scenario dashboard
+
+```{r}
+# Purpose: Assemble small multiples dashboard.
+# Why: Provide a compact visualization deliverable.
+# Assumptions: Use base ggplot facets and arrange.
+
+p1 <- p_overall
+p2 <- p_subgroup
+
+p1
+p2
+```
