@@ -1,0 +1,230 @@
+---
+title: "Titanic Survival: Groups, Families, and Women-and-Children-First"
+author: "CLI Copilot"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    self-contained: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Plan and Data
+
+This report analyzes two questions using the Titanic dataset in `data/train.csv` and `data/test.csv`:
+
+- Do travel groups survive together? We examine survival vs ticket-group size, family size, and alone status; and add features GroupSize (count per Ticket), IsAlone, FamilySize to a model, comparing cross-validation to a baseline using Sex, Pclass, Age, Fare.
+- How strong is women and children first once you include class? We examine survival by Sex × Age band and Sex × Pclass, and fit logistic regression with interaction terms Sex*Child and Sex*Pclass versus a tree model; compare cross-validation and interpret key effects.
+
+We use tidyverse for manipulation and ggplot2 for plotting with a minimalist style and consistent formatting.
+
+```{r}
+library(tidyverse)
+library(broom)
+library(rsample)
+library(yardstick)
+library(glmnet)
+library(modelr)
+library(knitr)
+library(ggthemes)
+
+# Read data
+train <- read_csv("data/train.csv")
+
+# Basic cleaning: create key features
+train <- train %>%
+  mutate(
+    Sex = factor(Sex),
+    Pclass = factor(Pclass),
+    FamilySize = SibSp + Parch + 1,
+    Ticket = as.character(Ticket),
+    # GroupSize: number of passengers sharing the same Ticket
+    GroupSize = add_count(., Ticket)$n,
+    IsAlone = as.integer(FamilySize == 1),
+    # Child: Age < 16; handle missing Age using median by Sex/Pclass
+    Age = ifelse(is.na(Age), ave(Age, Sex, Pclass, FUN = function(x) ifelse(all(is.na(x)), median(train$Age, na.rm = TRUE), median(x, na.rm = TRUE))), Age),
+    Child = as.integer(Age < 16),
+    Survived = factor(Survived, levels = c(0,1), labels = c("No","Yes"))
+  )
+
+# minimalist theme
+theme_base <- theme_minimal(base_size = 12) + theme(legend.position = "bottom")
+```
+
+# 1) Do travel groups survive together
+
+## EDA: Survival vs ticket-group size, family size, and alone status
+
+We investigate whether larger travel groups and families had different survival outcomes, and whether being alone mattered.
+
+```{r}
+# Group survival rate by GroupSize
+eda_group <- train %>%
+  group_by(GroupSize) %>%
+  summarize(n = n(), surv_rate = mean(Survived == "Yes"), .groups = "drop")
+
+ggplot(eda_group, aes(GroupSize, surv_rate)) +
+  geom_point() + geom_smooth(method = "loess", se = FALSE) +
+  labs(title = "Survival rate by Ticket GroupSize",
+       x = "GroupSize (same Ticket count)", y = "Survival rate") +
+  theme_base
+```
+
+```{r}
+# Survival rate by FamilySize
+eda_family <- train %>%
+  group_by(FamilySize) %>%
+  summarize(n = n(), surv_rate = mean(Survived == "Yes"), .groups = "drop")
+
+ggplot(eda_family, aes(FamilySize, surv_rate)) +
+  geom_point() + geom_smooth(method = "loess", se = FALSE) +
+  labs(title = "Survival rate by FamilySize",
+       x = "FamilySize (SibSp + Parch + 1)", y = "Survival rate") +
+  theme_base
+```
+
+```{r}
+# Survival rate by IsAlone
+eda_alone <- train %>%
+  group_by(IsAlone) %>%
+  summarize(n = n(), surv_rate = mean(Survived == "Yes"), .groups = "drop")
+
+ggplot(eda_alone, aes(factor(IsAlone), surv_rate)) +
+  geom_col() +
+  labs(title = "Survival rate: Alone vs Not Alone",
+       x = "IsAlone (1 = alone)", y = "Survival rate") +
+  theme_base
+```
+
+## Models: Baseline vs Group features
+
+We compare a baseline logistic regression (Sex, Pclass, Age, Fare) to a model adding GroupSize, FamilySize, IsAlone. We perform 5-fold cross-validation and report accuracy and ROC AUC.
+
+```{r}
+set.seed(42)
+folds <- vfold_cv(train, v = 5, strata = Survived)
+
+cv_metrics <- function(df, formula) {
+  map_dfr(folds$splits, function(s) {
+    tr <- analysis(s)
+    te <- assessment(s)
+    fit <- glm(formula, data = tr, family = binomial())
+    prob <- predict(fit, newdata = te, type = "response")
+    pred <- factor(ifelse(prob > 0.5, "Yes", "No"), levels = c("No","Yes"))
+    tibble(
+      accuracy = yardstick::accuracy_vec(te$Survived, pred),
+      roc_auc = yardstick::roc_auc_vec(te$Survived, prob, event_level = "second")
+    )
+  }) %>% summarize(across(everything(), mean))
+}
+
+baseline_formula <- Survived ~ Sex + Pclass + Age + Fare
+group_formula    <- Survived ~ Sex + Pclass + Age + Fare + GroupSize + FamilySize + IsAlone
+
+metrics_baseline <- cv_metrics(train, baseline_formula)
+metrics_group    <- cv_metrics(train, group_formula)
+
+bind_rows(
+  metrics_baseline %>% mutate(model = "Baseline"),
+  metrics_group %>% mutate(model = "+Groups")
+) %>% select(model, accuracy, roc_auc) %>% knitr::kable(digits = 3)
+```
+
+# 2) Women and children first once you include class
+
+## EDA: Survival by Sex × Age band and Sex × Pclass
+
+We explore whether the principle of women and children first holds across passenger classes.
+
+```{r}
+# Age bands
+train <- train %>% mutate(AgeBand = cut(Age, breaks = c(0, 8, 16, 24, 40, 60, Inf), right = FALSE))
+
+# Survival by Sex × AgeBand
+eda_sex_age <- train %>%
+  group_by(Sex, AgeBand) %>%
+  summarize(n = n(), surv_rate = mean(Survived == "Yes"), .groups = "drop")
+
+ggplot(eda_sex_age, aes(AgeBand, surv_rate, fill = Sex)) +
+  geom_col(position = position_dodge(width = 0.8)) +
+  labs(title = "Survival rate by Sex × Age band",
+       x = "Age band", y = "Survival rate") +
+  theme_base
+```
+
+```{r}
+# Survival by Sex × Pclass
+eda_sex_pclass <- train %>%
+  group_by(Sex, Pclass) %>%
+  summarize(n = n(), surv_rate = mean(Survived == "Yes"), .groups = "drop")
+
+ggplot(eda_sex_pclass, aes(Pclass, surv_rate, fill = Sex)) +
+  geom_col(position = position_dodge(width = 0.8)) +
+  labs(title = "Survival rate by Sex × Pclass",
+       x = "Passenger Class", y = "Survival rate") +
+  theme_base
+```
+
+## Models: Logistic regression with interactions vs tree
+
+We fit logistic regression with interaction terms Sex*Child and Sex*Pclass, and compare to a tree-based model (rpart). We perform 5-fold CV and compare metrics.
+
+```{r}
+library(rpart)
+library(rpart.plot)
+
+set.seed(42)
+folds <- vfold_cv(train, v = 5, strata = Survived)
+
+cv_models <- function(df) {
+  map_dfr(folds$splits, function(s) {
+    tr <- analysis(s)
+    te <- assessment(s)
+    # Logistic with interactions
+    fit_logit <- glm(Survived ~ Sex * Child + Sex * Pclass + Age + Fare, data = tr, family = binomial())
+    prob_logit <- predict(fit_logit, newdata = te, type = "response")
+    pred_logit <- factor(ifelse(prob_logit > 0.5, "Yes", "No"), levels = c("No","Yes"))
+
+    # Tree model
+    fit_tree <- rpart(Survived ~ Sex + Child + Pclass + Age + Fare + FamilySize + GroupSize,
+                      data = tr, method = "class", control = rpart.control(cp = 0.01))
+    prob_tree <- predict(fit_tree, newdata = te, type = "prob")[,"Yes"]
+    pred_tree <- factor(ifelse(prob_tree > 0.5, "Yes", "No"), levels = c("No","Yes"))
+
+    tibble(
+      model = c("Logit_int", "Tree"),
+      accuracy = c(yardstick::accuracy_vec(te$Survived, pred_logit), yardstick::accuracy_vec(te$Survived, pred_tree)),
+      roc_auc = c(yardstick::roc_auc_vec(te$Survived, prob_logit, event_level = "second"), yardstick::roc_auc_vec(te$Survived, prob_tree, event_level = "second"))
+    )
+  }) %>% group_by(model) %>% summarize(across(c(accuracy, roc_auc), mean), .groups = "drop")
+}
+
+model_metrics <- cv_models(train)
+
+model_metrics %>% knitr::kable(digits = 3)
+```
+
+```{r}
+# Interpret key effects for logistic model on full data
+fit_logit_full <- glm(Survived ~ Sex * Child + Sex * Pclass + Age + Fare, data = train, family = binomial())
+tidy(fit_logit_full, exponentiate = TRUE, conf.int = TRUE) %>%
+  arrange(desc(estimate)) %>%
+  knitr::kable(digits = 3, caption = "Odds ratios with 95% CI: key effects")
+```
+
+```{r}
+# Visualize tree for full data
+fit_tree_full <- rpart(Survived ~ Sex + Child + Pclass + Age + Fare + FamilySize + GroupSize,
+                      data = train, method = "class", control = rpart.control(cp = 0.01))
+rpart.plot(fit_tree_full, type = 2, extra = 104, under = TRUE, fallen.leaves = TRUE)
+```
+
+# Notes and Assumptions
+
+- Age imputation uses median within Sex × Pclass groups; if a group is entirely missing, fall back to global median. This keeps information leakage minimal, as imputation is performed before cross-validation and uses stratified attributes rather than outcome.
+- GroupSize uses Ticket string as proxy for travel group; this may include unrelated people sharing ticket numbers, but serves as a reasonable proxy in the Kaggle Titanic dataset.
+- We report mean CV accuracy and ROC AUC to compare models.
