@@ -1,4 +1,4 @@
-## 0) Git hygiene
+## 1) Git hygiene
 
 - Ensure you’re on the `main` branch:
   - `git checkout main`
@@ -7,18 +7,12 @@
 
 ---
 
-## 1) Data locations
+## 2) Data locations
 
 - Train and test CSV files are in: `@data/`
 - Data description is in: `@CLI_md/data_description.md`
 
 ---
-
-## 2) Work location 
-
-- Create a new folder within `@source/` for your analysis.
-- Name your folder accordingly with a timestamp and a descriptive topic.
-  - Example: `20240401_1430_customer_churn_analysis/`
 
 ---
 ## Workflow expectation: iterative report development 
