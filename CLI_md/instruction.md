@@ -73,6 +73,7 @@ execute:
 
 #### Tables design
 - All table should be compiled with `knitr::kable()` for better formatting
+- **Make sure** all table formatting are consistent across the report
 
 #### File naming
 
