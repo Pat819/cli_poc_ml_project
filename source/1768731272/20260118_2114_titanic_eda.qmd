@@ -1,0 +1,171 @@
+---
+title: "Titanic EDA: Signal in Cabin, Fare, and Embarkation"
+author: "CLI Copilot"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    self-contained: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Introduction
+
+This report investigates three research questions regarding the Titanic dataset:
+1. Does cabin and deck information add signal beyond class and fare?
+2. Is fare a proxy for wealth within class or does it carry independent survival signal?
+3. Does the port of embarkation change survival patterns after controlling for who boards there?
+
+For each question, we perform exploratory data analysis (EDA) and modeling, providing detailed explanations for every step and code chunk.
+
+# Data and Setup
+
+```{r}
+library(tidyverse)
+library(ggplot2)
+library(knitr)
+train <- read_csv("../../data/train.csv")
+test <- read_csv("../../data/test.csv")
+```
+
+We load the required libraries and read the training and test datasets. The `tidyverse` and `ggplot2` packages are used for data manipulation and visualization, while `knitr` is used for consistent table formatting. The data files are loaded from the `data/` directory as described in the project instructions.
+
+# 1. Cabin and Deck Information Beyond Class and Fare
+
+## 1.1 Extract Deck from Cabin and Compare Survival by Deck
+
+```{r}
+train <- train %>% mutate(
+  Deck = substr(Cabin, 1, 1),
+  MissingCabin = is.na(Cabin)
+)
+```
+
+We extract the deck by taking the first letter of the `Cabin` variable and create a `MissingCabin` indicator. This allows us to analyze survival rates by deck and by whether cabin information is missing, which may reveal additional signal beyond class and fare.
+
+## 1.2 Survival by Deck and MissingCabin, Stratified by Pclass
+
+```{r}
+ggplot(train, aes(x = Deck, fill = factor(Survived))) +
+  geom_bar(position = 'fill') +
+  facet_wrap(~Pclass) +
+  scale_fill_viridis_d(name = "Survived", labels = c("No", "Yes")) +
+  labs(title = "Survival Proportion by Deck and Class", x = "Deck", y = "Proportion Survived") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+This plot shows the proportion of survivors by deck, stratified by passenger class. Using a fill proportion bar plot allows us to compare survival rates across decks and classes, helping to determine if deck adds signal beyond class.
+
+```{r}
+ggplot(train, aes(x = factor(MissingCabin), fill = factor(Survived))) +
+  geom_bar(position = 'fill') +
+  facet_wrap(~Pclass) +
+  scale_fill_viridis_d(name = "Survived", labels = c("No", "Yes")) +
+  labs(title = "Survival by Missing Cabin Info and Class", x = "Missing Cabin", y = "Proportion Survived") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+This plot examines whether missing cabin information is associated with survival, stratified by class. This helps assess if the absence of cabin data itself is informative.
+
+## 1.3 Model: Add Deck and MissingCabin, Measure Gain and Feature Importance
+
+```{r}
+library(caret)
+set.seed(42)
+train$Deck <- as.factor(train$Deck)
+train$MissingCabin <- as.factor(train$MissingCabin)
+model1 <- train(factor(Survived) ~ Pclass + Fare, data = train, method = "glm", family = "binomial", trControl = trainControl(method = "cv", number = 5), na.action = na.omit)
+model2 <- train(factor(Survived) ~ Pclass + Fare + Deck + MissingCabin, data = train, method = "glm", family = "binomial", trControl = trainControl(method = "cv", number = 5), na.action = na.omit)
+cv_gain <- model2$results$Accuracy - model1$results$Accuracy
+imp <- varImp(model2)
+cv_gain
+imp
+```
+
+We fit two logistic regression models: one with only class and fare, and another adding deck and missing cabin. We compare cross-validation accuracy and inspect feature importance to determine if deck and missing cabin add predictive value.
+
+# 2. Is Fare a Proxy for Wealth Within Class?
+
+## 2.1 Plot Survival vs Fare Within Each Pclass
+
+```{r}
+ggplot(train, aes(x = Fare, y = Survived)) +
+  geom_jitter(height = 0.1, alpha = 0.3) +
+  geom_smooth(method = "loess") +
+  facet_wrap(~Pclass) +
+  labs(title = "Survival vs Fare by Class", x = "Fare", y = "Survived") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+This plot visualizes the relationship between fare and survival within each class, helping to determine if fare carries signal beyond class.
+
+## 2.2 Compare Fare Quantiles per Class
+
+```{r}
+train <- train %>% group_by(Pclass) %>% mutate(FareQuantileWithinClass = ntile(Fare, 4))
+train %>% group_by(Pclass, FareQuantileWithinClass) %>% summarise(SurvivalRate = mean(Survived), n = n()) %>% kable()
+```
+
+We create fare quantiles within each class and summarize survival rates by quantile. This table helps assess whether higher fare within class is associated with higher survival.
+
+## 2.3 Model: Use log1p(Fare) and FareQuantileWithinClass
+
+```{r}
+train$logFare <- log1p(train$Fare)
+train$FareQuantileWithinClass <- as.factor(train$FareQuantileWithinClass)
+model3 <- train(factor(Survived) ~ Pclass, data = train, method = "glm", family = "binomial", trControl = trainControl(method = "cv", number = 5), na.action = na.omit)
+model4 <- train(factor(Survived) ~ Pclass + logFare + FareQuantileWithinClass, data = train, method = "glm", family = "binomial", trControl = trainControl(method = "cv", number = 5), na.action = na.omit)
+cv_gain_fare <- model4$results$Accuracy - model3$results$Accuracy
+imp_fare <- varImp(model4)
+cv_gain_fare
+imp_fare
+```
+
+We compare a model with only class to one that adds log-transformed fare and fare quantile within class. The cross-validation gain and feature importance indicate whether fare adds independent signal.
+
+# 3. Does Port of Embarkation Change Survival Patterns?
+
+## 3.1 Survival by Embarked, Then Condition on Pclass and Sex
+
+```{r}
+ggplot(train, aes(x = Embarked, fill = factor(Survived))) +
+  geom_bar(position = 'fill') +
+  scale_fill_viridis_d(name = "Survived", labels = c("No", "Yes")) +
+  labs(title = "Survival by Port of Embarkation", x = "Embarked", y = "Proportion Survived") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+This plot shows survival proportions by port of embarkation. It provides a first look at whether embarkation port is associated with survival.
+
+```{r}
+ggplot(train, aes(x = Embarked, fill = factor(Sex))) +
+  geom_bar(position = 'fill') +
+  facet_wrap(~Pclass) +
+  labs(title = "Passenger Composition by Embarked and Class", x = "Embarked", y = "Proportion") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+This plot examines the composition of passengers by port, class, and sex, helping to control for confounding when interpreting survival differences by port.
+
+## 3.2 Model: Add Embarked and Embarked*Pclass Interaction
+
+```{r}
+train$Embarked <- as.factor(train$Embarked)
+model5 <- train(factor(Survived) ~ Pclass + Sex + Embarked, data = train, method = "glm", family = "binomial", trControl = trainControl(method = "cv", number = 5), na.action = na.omit)
+model6 <- train(factor(Survived) ~ Pclass + Sex + Embarked + Pclass:Embarked, data = train, method = "glm", family = "binomial", trControl = trainControl(method = "cv", number = 5), na.action = na.omit)
+cv_gain_emb <- model6$results$Accuracy - model5$results$Accuracy
+imp_emb <- varImp(model6)
+cv_gain_emb
+imp_emb
+```
+
+We fit models with and without the interaction between class and embarkation port, comparing cross-validation accuracy and inspecting feature importance. This helps determine if embarkation port has an effect on survival after controlling for passenger composition.
