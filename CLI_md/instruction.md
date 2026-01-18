@@ -41,9 +41,9 @@ You may install additional R packages if needed.
   - what assumptions you are making,
   - How is the action helps to address the research question
 - For example, if your report have 3 sections (A, B, C) and each section have 3 code chunks (1, 2, 3), then you should have at least 9 paragraphs to explain your logic behind each code chunk
-- Avoid drawing conclusion, your job is to designs steps to help answer the research question, not to answer it directly.
-- Do not hullucinate, everything should be based on facts
-- Use logical reasoning to guide user to make their own conclusion.
+- **Important** Avoid drawing conclusio or observations, your job is to designs steps to help answer the research question, not to answer it directly. Focus on *how* to make a decision, not *what* the decision is.
+  - Do not hullucinate, everything should be based on facts
+  - Use logical reasoning to guide user to make their own conclusion.
 
 #### qmd Header
 
