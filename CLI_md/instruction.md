@@ -18,7 +18,7 @@
 ## Workflow expectation: iterative report development 
 
 ### Goal
-Produce a high-quality, reproducible report that answers the research questions using best practices in data analysis and visualization.
+Produce a high-quality, reproducible report that propose analysis component to help answering research questions using best practices in data analysis and visualization.
 Use R with a strong emphasis on tidyverse and ggplot2.
 You may install additional R packages if needed.
 
@@ -41,7 +41,9 @@ You may install additional R packages if needed.
   - what assumptions you are making,
   - How is the action helps to address the research question
 - For example, if your report have 3 sections (A, B, C) and each section have 3 code chunks (1, 2, 3), then you should have at least 9 paragraphs to explain your logic behind each code chunk
-- The goal is to produce a report where a reader can easily follow your logic by going through the text and verify your work by looking at the code chunks
+- Avoid drawing conclusion, your job is to designs steps to help answer the research question, not to answer it directly.
+- Do not hullucinate, everything should be based on facts
+- Use logical reasoning to guide user to make their own conclusion.
 
 #### qmd Header
 
