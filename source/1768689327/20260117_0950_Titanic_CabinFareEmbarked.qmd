@@ -1,0 +1,271 @@
+---
+title: "Titanic: Do Cabin/Deck, Fare, and Embarkation add signal beyond Class?"
+author: "CLI Copilot"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    self-contained: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Overview
+
+This report investigates three questions on the Titanic dataset (train.csv/test.csv in @data/):
+- Does cabin and deck information add signal beyond class and fare?
+- Is fare a proxy for wealth within class or does it carry independent survival signal?
+- Does the port of embarkation change survival patterns after controlling for who boards there?
+
+We use R (tidyverse, tidymodels) with Quarto. Each code chunk is accompanied by detailed rationale, assumptions, and how it addresses the research questions.
+
+```{r}
+#| label: setup-packages
+#| include: true
+# Purpose: Load required packages and set theme.
+# Rationale: Centralize dependencies and set consistent plotting theme.
+# Assumptions: Packages are available; if not, install.
+# Contribution: Enables reproducible data handling and visualization.
+
+required_pkgs <- c("tidyverse", "tidymodels", "scales", "janitor")
+for (p in required_pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+}
+library(tidyverse)
+library(tidymodels)
+library(scales)
+library(janitor)
+
+theme_set(theme_minimal(base_size = 12))
+update_geom_defaults("point", list(alpha = 0.7))
+```
+
+```{r}
+#| label: load-data
+# Purpose: Load train and test datasets.
+# Rationale: Use canonical Kaggle Titanic datasets from @data/.
+# Assumptions: CSVs exist at relative path data/.
+# Contribution: Provides input for EDA and modeling.
+
+train <- read_csv("../../data/train.csv") %>% clean_names()
+test  <- read_csv("../../data/test.csv")  %>% clean_names()
+
+# quick glimpse
+list(train = dim(train), test = dim(test))
+```
+
+```{r}
+#| label: feature-engineering-cabin
+# Purpose: Extract Deck from Cabin, create MissingCabin indicator.
+# Rationale: Test additional signal beyond class/fare.
+# Assumptions: Deck approximated by first letter of cabin; NA cabins flagged.
+# Contribution: Variables for Q1 EDA and models.
+
+extract_deck <- function(cabin) {
+  ifelse(is.na(cabin) | cabin == "", NA_character_, str_sub(cabin, 1, 1))
+}
+
+train_fe <- train %>%
+  mutate(deck = extract_deck(cabin),
+         missing_cabin = if_else(is.na(cabin) | cabin == "", 1L, 0L),
+         pclass = factor(pclass),
+         sex = factor(sex),
+         embarked = factor(embarked),
+         survived = factor(survived))
+```
+
+# 1) Cabin/Deck signal beyond class and fare
+
+```{r}
+#| label: eda-deck
+# Purpose: Compare survival by Deck and MissingCabin, stratified by Pclass.
+# Rationale: Visual + tabular comparison.
+# Assumptions: Survival is 0/1, missing deck shown explicitly.
+# Contribution: Evidence whether deck adds signal.
+
+p_deck <- train_fe %>%
+  mutate(deck2 = fct_explicit_na(deck, na_level = "Missing")) %>%
+  group_by(pclass, deck2) %>%
+  summarize(survival_rate = mean(survived, na.rm = TRUE), n = n(), .groups = "drop")
+
+knitr::kable(p_deck, caption = "Survival by Pclass and Deck (Missing explicit)")
+
+ggplot(p_deck, aes(deck2, survival_rate, fill = deck2)) +
+  geom_col() +
+  facet_wrap(~ pclass, nrow = 1) +
+  scale_y_continuous(labels = percent_format()) +
+  guides(fill = "none") +
+  labs(title = "Survival by Deck within Class", x = "Deck", y = "Survival Rate")
+```
+
+```{r}
+#| label: model-deck
+# Purpose: Add Deck and MissingCabin to a baseline model and measure CV gain.
+# Rationale: Quantify incremental value beyond class+fare.
+# Assumptions: Use logistic regression for interpretability; simple imputation.
+# Contribution: Model-based evidence and feature importance via coefficients.
+
+set.seed(123)
+splits <- vfold_cv(train_fe, v = 5, strata = survived)
+
+baseline_rec <- recipe(survived ~ pclass + fare + sex, data = train_fe) %>%
+  step_log(fare, offset = 1) %>%
+  step_impute_mean(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors())
+
+plus_deck_rec <- recipe(survived ~ pclass + fare + sex + deck + missing_cabin, data = train_fe) %>%
+  step_log(fare, offset = 1) %>%
+  step_impute_mean(all_numeric_predictors()) %>%
+  step_unknown(deck) %>%
+  step_dummy(all_nominal_predictors())
+
+log_spec <- logistic_reg() %>% set_engine("glm") %>% set_mode("classification")
+
+wf_base <- workflow() %>% add_model(log_spec) %>% add_recipe(baseline_rec)
+wf_deck <- workflow() %>% add_model(log_spec) %>% add_recipe(plus_deck_rec)
+
+res_base <- fit_resamples(wf_base, splits, metrics = metric_set(roc_auc, accuracy))
+res_deck <- fit_resamples(wf_deck, splits, metrics = metric_set(roc_auc, accuracy))
+
+collect_metrics(res_base) %>% knitr::kable(caption = "Baseline (Pclass+Fare+Sex) CV metrics")
+collect_metrics(res_deck) %>% knitr::kable(caption = "+Deck+MissingCabin CV metrics")
+
+fit_deck <- fit(wf_deck, data = train_fe)
+coef_tbl <- broom::tidy(fit_deck$fit$fit) %>% arrange(desc(abs(estimate)))
+knitr::kable(coef_tbl, caption = "Logistic coefficients (absolute magnitude sorted)")
+```
+
+# 2) Fare signal within class
+
+```{r}
+#| label: eda-fare
+# Purpose: Plot survival vs Fare within each Pclass; compare fare quantiles per class.
+# Rationale: Assess whether fare within-class differentiates survival.
+# Assumptions: Use log1p to handle skew; quantiles computed per class.
+# Contribution: Visual and tabular evidence.
+
+train_fe2 <- train_fe %>% mutate(fare_log1p = log1p(fare))
+
+p_fare <- train_fe2 %>%
+  ggplot(aes(fare_log1p, survived)) +
+  geom_jitter(height = 0.02, width = 0, alpha = 0.4) +
+  geom_smooth(method = "loess") +
+  facet_wrap(~ pclass) +
+  labs(title = "Survival vs log1p(Fare) within Class", x = "log1p(Fare)", y = "Survived")
+
+p_fare
+
+fare_q <- train_fe %>%
+  group_by(pclass) %>%
+  summarize(q10 = quantile(fare, 0.10, na.rm = TRUE),
+            q25 = quantile(fare, 0.25, na.rm = TRUE),
+            q50 = quantile(fare, 0.50, na.rm = TRUE),
+            q75 = quantile(fare, 0.75, na.rm = TRUE),
+            q90 = quantile(fare, 0.90, na.rm = TRUE), .groups = "drop")
+
+knitr::kable(fare_q, caption = "Fare quantiles within Pclass")
+```
+
+```{r}
+#| label: model-fare
+# Purpose: Use log1p(Fare) and FareQuantileWithinClass; test incremental value over Pclass alone.
+# Rationale: Quantify independent signal beyond class.
+# Assumptions: Simple binning by within-class quantiles; logistic regression.
+# Contribution: Model-based evidence.
+
+train_fe3 <- train_fe %>%
+  group_by(pclass) %>%
+  mutate(fare_quantile = ntile(fare, 4)) %>%
+  ungroup() %>%
+  mutate(fare_log1p = log1p(fare), fare_quantile = factor(fare_quantile))
+
+splits_fare <- vfold_cv(train_fe3, v = 5, strata = survived)
+
+rec_pclass <- recipe(survived ~ pclass + sex, data = train_fe3) %>%
+  step_dummy(all_nominal_predictors())
+
+rec_pclass_fare <- recipe(survived ~ pclass + sex + fare_log1p + fare_quantile, data = train_fe3) %>%
+  step_impute_mean(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors())
+
+wf_pclass <- workflow() %>% add_model(log_spec) %>% add_recipe(rec_pclass)
+wf_pclass_fare <- workflow() %>% add_model(log_spec) %>% add_recipe(rec_pclass_fare)
+
+res_pclass <- fit_resamples(wf_pclass, splits_fare, metrics = metric_set(roc_auc, accuracy))
+res_pclass_fare <- fit_resamples(wf_pclass_fare, splits_fare, metrics = metric_set(roc_auc, accuracy))
+
+collect_metrics(res_pclass) %>% knitr::kable(caption = "Pclass+Sex CV metrics")
+collect_metrics(res_pclass_fare) %>% knitr::kable(caption = "+Fare (log1p + within-class quantile) CV metrics")
+```
+
+# 3) Embarkation patterns controlling for composition
+
+```{r}
+#| label: eda-embarked
+# Purpose: Survival by Embarked, then condition on Pclass and Sex to see composition effects.
+# Rationale: Separate composition from within-port effects.
+# Assumptions: Embarked may be missing; treat missing explicitly.
+# Contribution: EDA evidence for Q3.
+
+emb_tbl <- train_fe %>%
+  mutate(embarked2 = fct_explicit_na(embarked, na_level = "Missing")) %>%
+  group_by(embarked2) %>%
+  summarize(survival_rate = mean(survived, na.rm = TRUE), n = n(), .groups = "drop")
+knitr::kable(emb_tbl, caption = "Overall survival by Embarked")
+
+emb_comp <- train_fe %>%
+  mutate(embarked2 = fct_explicit_na(embarked, na_level = "Missing")) %>%
+  group_by(embarked2, pclass, sex) %>%
+  summarize(survival_rate = mean(survived, na.rm = TRUE), n = n(), .groups = "drop")
+
+ggplot(emb_comp, aes(pclass, survival_rate, fill = sex)) +
+  geom_col(position = position_dodge()) +
+  facet_wrap(~ embarked2) +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "Survival by Pclass and Sex within Embarkation Ports", x = "Pclass", y = "Survival Rate") +
+  theme(legend.position = "bottom")
+```
+
+```{r}
+#| label: model-embarked
+# Purpose: Add Embarked and interaction Embarked*Pclass; compare CV and inspect coefficients.
+# Rationale: Test whether port carries signal after controlling for composition.
+# Assumptions: Logistic regression with interaction terms; unknown handling.
+# Contribution: Model-based evidence.
+
+rec_emb <- recipe(survived ~ pclass + sex + embarked, data = train_fe) %>%
+  step_unknown(embarked) %>%
+  step_dummy(all_nominal_predictors())
+
+rec_emb_inter <- recipe(survived ~ pclass + embarked + sex, data = train_fe) %>%
+  step_unknown(embarked) %>%
+  step_interact(terms = ~ pclass:embarked) %>%
+  step_dummy(all_nominal_predictors())
+
+wf_emb <- workflow() %>% add_model(log_spec) %>% add_recipe(rec_emb)
+wf_emb_int <- workflow() %>% add_model(log_spec) %>% add_recipe(rec_emb_inter)
+
+res_emb <- fit_resamples(wf_emb, splits, metrics = metric_set(roc_auc, accuracy))
+res_emb_int <- fit_resamples(wf_emb_int, splits, metrics = metric_set(roc_auc, accuracy))
+
+collect_metrics(res_emb) %>% knitr::kable(caption = "Embarked added CV metrics")
+collect_metrics(res_emb_int) %>% knitr::kable(caption = "Embarked*Pclass interaction CV metrics")
+
+fit_emb_int <- fit(wf_emb_int, data = train_fe)
+emb_coef <- broom::tidy(fit_emb_int$fit$fit) %>% arrange(desc(abs(estimate)))
+knitr::kable(emb_coef, caption = "Coefficients with Embarked*Pclass interaction")
+```
+
+# Notes on assumptions and limitations
+- Deck derived from cabin first letter; missing cabins common and may correlate with ticketing processes.
+- Fare is skewed; log1p transformation stabilizes variance; within-class quantiles approximate relative price/wealth.
+- Embarked may reflect route logistics; interaction captures port-specific class composition effects.
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
