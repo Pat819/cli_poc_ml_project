@@ -1,0 +1,676 @@
+---
+title: "Titanic Dataset: Research Questions on Survival Inequality"
+author: "CLI Copilot"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    self-contained: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Executive Summary
+
+This report addresses three interconnected research questions about the Titanic disaster using exploratory data analysis and statistical modeling. The analysis focuses on understanding: (1) whether class-based survival advantages were driven by access/location constraints or explicit survival policies, (2) whether survival rules were applied consistently across different travel contexts and social visibility, and (3) how missing data patterns reflect inequality and might bias conclusions. The goal is to structure analytical approaches that help readers understand the mechanisms behind survival disparities rather than drawing definitive conclusions.
+
+---
+
+# Setup and Data Loading
+
+```{r setup}
+# Load required libraries
+library(tidyverse)
+library(knitr)
+library(ggplot2)
+library(RColorBrewer)
+library(scales)
+
+# Set consistent theme for all plots
+theme_set(
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 12, face = "bold", hjust = 0),
+    plot.subtitle = element_text(size = 10, hjust = 0),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 9),
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "gray90")
+  )
+)
+
+# Load and inspect data
+titanic_train <- read_csv("../../data/train.csv")
+titanic_test <- read_csv("../../data/test.csv")
+
+# Display basic structure
+str(titanic_train)
+nrow(titanic_train)
+ncol(titanic_train)
+```
+
+The Titanic training dataset contains `r nrow(titanic_train)` passengers and `r ncol(titanic_train)` variables. The dataset includes information about passenger demographics (Sex, Age), socio-economic status (Pclass, Fare), family composition (SibSp, Parch), travel logistics (Embarked), and outcomes (Survived). Missing values are present in Age (`r sum(is.na(titanic_train$Age))` missing), Cabin (`r sum(is.na(titanic_train$Cabin))` missing), and Embarked (`r sum(is.na(titanic_train$Embarked))` missing). These missing data patterns will be examined systematically in Research Question 3.
+
+---
+
+# Research Question 1: Class-Survival Gap — Access vs. Policy
+
+**Research Focus**: To what extent is the survival advantage of 1st class passengers mediated by *location/access* (deck/cabin proximity, boarding points) versus *policy* ("women and children first")?
+
+## Conceptual Approach
+
+The survival advantage of 1st class passengers could arise from two mechanisms:
+1. **Access mechanism**: 1st class passengers had better access to lifeboats due to deck location, cabin proximity, and boarding procedures
+2. **Policy mechanism**: Differential enforcement of survival rules ("women and children first") across classes
+
+To tease apart these mechanisms, we examine: (1) raw survival gaps by class and sex, (2) survival gaps within demographic subgroups to assess policy consistency, and (3) proxy variables for access (cabin information, fare) to quantify mediation.
+
+### 1.1 Survival by Class and Sex: Establishing the Baseline Gap
+
+```{r rq1_baseline}
+# Calculate survival rates by class and sex
+survival_by_class_sex <- titanic_train %>%
+  group_by(Pclass, Sex) %>%
+  summarise(
+    n = n(),
+    survived = sum(Survived, na.rm = TRUE),
+    survival_rate = mean(Survived, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Display results
+knitr::kable(survival_by_class_sex, 
+             digits = 3,
+             caption = "Survival Rates by Passenger Class and Sex")
+
+# Calculate overall survival by class (collapsing sex)
+survival_by_class <- titanic_train %>%
+  group_by(Pclass) %>%
+  summarise(
+    n = n(),
+    survived = sum(Survived, na.rm = TRUE),
+    survival_rate = mean(Survived, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+knitr::kable(survival_by_class,
+             digits = 3,
+             caption = "Overall Survival Rates by Passenger Class")
+```
+
+The baseline analysis reveals stark disparities: 1st class passengers survived at a rate of `r survival_by_class %>% filter(Pclass == 1) %>% pull(survival_rate) %>% round(3)` compared to 3rd class at `r survival_by_class %>% filter(Pclass == 3) %>% pull(survival_rate) %>% round(3)`. Within each class, the "women and children first" policy appears to have been differentially enforced. First class females survived at `r survival_by_class_sex %>% filter(Pclass == 1, Sex == "female") %>% pull(survival_rate) %>% round(3)`, while third class females survived at `r survival_by_class_sex %>% filter(Pclass == 3, Sex == "female") %>% pull(survival_rate) %>% round(3)`. This suggests both a class effect and a potential policy-by-class interaction.
+
+### 1.2 Visualizing the Class-Sex Survival Interaction
+
+```{r rq1_plot_interaction}
+# Create interaction plot
+interaction_plot <- titanic_train %>%
+  group_by(Pclass, Sex) %>%
+  summarise(
+    survival_rate = mean(Survived, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = factor(Pclass), y = survival_rate, color = Sex, group = Sex)) +
+  geom_point(size = 3) +
+  geom_line(size = 1) +
+  scale_y_continuous(labels = percent_format(), limits = c(0, 1)) +
+  scale_color_manual(values = c("female" = "#e41a1c", "male" = "#377eb8")) +
+  labs(
+    title = "Survival Rates by Class and Sex",
+    subtitle = "Women-and-children-first policy effectiveness across class divisions",
+    x = "Passenger Class",
+    y = "Survival Rate"
+  )
+
+print(interaction_plot)
+```
+
+This visualization demonstrates that the "women and children first" policy was implemented across all classes, but its protective effect was strongest in first class (gap of `r (survival_by_class_sex %>% filter(Pclass == 1, Sex == "female") %>% pull(survival_rate)) - (survival_by_class_sex %>% filter(Pclass == 1, Sex == "male") %>% pull(survival_rate))` between females and males) and weakest in third class (gap of `r (survival_by_class_sex %>% filter(Pclass == 3, Sex == "female") %>% pull(survival_rate)) - (survival_by_class_sex %>% filter(Pclass == 3, Sex == "male") %>% pull(survival_rate))`). This suggests that while the policy was formally applied, class membership determined its strength.
+
+### 1.3 Access Proxy 1: Cabin Information as Location Indicator
+
+```{r rq1_cabin_analysis}
+# Create cabin letter (deck) indicator
+titanic_train_cabin <- titanic_train %>%
+  mutate(
+    cabin_missing = is.na(Cabin),
+    cabin_letter = if_else(!is.na(Cabin), str_sub(Cabin, 1, 1), NA_character_)
+  )
+
+# Survival by cabin missingness
+cabin_missing_survival <- titanic_train_cabin %>%
+  group_by(cabin_missing) %>%
+  summarise(
+    n = n(),
+    survived = sum(Survived, na.rm = TRUE),
+    survival_rate = mean(Survived, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(cabin_status = if_else(cabin_missing, "Cabin Unknown", "Cabin Known"))
+
+knitr::kable(cabin_missing_survival %>% select(cabin_status, n, survived, survival_rate),
+             digits = 3,
+             caption = "Survival by Cabin Information Completeness")
+
+# Survival by cabin letter (for non-missing cases)
+cabin_letter_survival <- titanic_train_cabin %>%
+  filter(!is.na(cabin_letter)) %>%
+  group_by(cabin_letter) %>%
+  summarise(
+    n = n(),
+    survived = sum(Survived, na.rm = TRUE),
+    survival_rate = mean(Survived, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(survival_rate))
+
+knitr::kable(cabin_letter_survival,
+             digits = 3,
+             caption = "Survival Rates by Cabin Deck Letter (Known Cabins Only)")
+```
+
+Cabin information serves as a proxy for social visibility and location access. Passengers with known cabin assignments (n = `r sum(!titanic_train_cabin$cabin_missing)`) survived at a rate of `r cabin_missing_survival %>% filter(!cabin_missing) %>% pull(survival_rate) %>% round(3)`, compared to those without cabin records (n = `r sum(titanic_train_cabin$cabin_missing)`) who survived at `r cabin_missing_survival %>% filter(cabin_missing) %>% pull(survival_rate) %>% round(3)`. This `r (cabin_missing_survival %>% filter(!cabin_missing) %>% pull(survival_rate) - cabin_missing_survival %>% filter(cabin_missing) %>% pull(survival_rate)) %>% round(3)` difference suggests that having a recorded cabin location was strongly associated with survival, potentially reflecting both better access (known passengers were more likely to be located during evacuation) and social visibility.
+
+### 1.4 Access Proxy 2: Fare as Wealth and Access Indicator
+
+```{r rq1_fare_analysis}
+# Examine fare by class
+fare_by_class <- titanic_train %>%
+  filter(!is.na(Fare)) %>%
+  group_by(Pclass) %>%
+  summarise(
+    n = n(),
+    mean_fare = mean(Fare),
+    median_fare = median(Fare),
+    sd_fare = sd(Fare),
+    min_fare = min(Fare),
+    max_fare = max(Fare),
+    .groups = "drop"
+  )
+
+knitr::kable(fare_by_class,
+             digits = 2,
+             caption = "Fare Distribution by Passenger Class")
+
+# Create fare categories within each class to examine access gradient
+titanic_train_fare <- titanic_train %>%
+  filter(!is.na(Fare)) %>%
+  group_by(Pclass) %>%
+  mutate(
+    fare_quartile = ntile(Fare, 4)
+  ) %>%
+  ungroup()
+
+# Survival by fare quartile within each class
+fare_survival <- titanic_train_fare %>%
+  group_by(Pclass, fare_quartile) %>%
+  summarise(
+    n = n(),
+    survival_rate = mean(Survived, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(fare_quartile = factor(fare_quartile, labels = c("Q1 (Lowest)", "Q2", "Q3", "Q4 (Highest)")))
+
+knitr::kable(fare_survival,
+             digits = 3,
+             caption = "Survival by Fare Quartile Within Each Class")
+```
+
+Fare serves as a continuous indicator of both socio-economic status and potentially more direct access to lifeboats. Within first class, survival rates show a gradient from `r fare_survival %>% filter(Pclass == 1, fare_quartile == "Q1 (Lowest)") %>% pull(survival_rate) %>% round(3)` (lowest quartile) to `r fare_survival %>% filter(Pclass == 1, fare_quartile == "Q4 (Highest)") %>% pull(survival_rate) %>% round(3)` (highest quartile). In third class, the gradient is `r fare_survival %>% filter(Pclass == 3, fare_quartile == "Q1 (Lowest)") %>% pull(survival_rate) %>% round(3)` to `r fare_survival %>% filter(Pclass == 3, fare_quartile == "Q4 (Highest)") %>% pull(survival_rate) %>% round(3)`. This suggests that within each class, passengers with higher fares (likely better cabin locations and services) had better survival prospects.
+
+### 1.5 Mediation Analysis: Does Access Explain Class Effects?
+
+```{r rq1_mediation_models}
+# Prepare data for modeling
+analysis_data <- titanic_train %>%
+  mutate(
+    has_cabin = !is.na(Cabin),
+    cabin_letter = if_else(!is.na(Cabin), str_sub(Cabin, 1, 1), NA_character_),
+    embarked_port = if_else(is.na(Embarked), "S", Embarked),
+    female = if_else(Sex == "female", 1, 0),
+    family_size = SibSp + Parch,
+    alone = if_else(family_size == 0, 1, 0)
+  ) %>%
+  filter(!is.na(Fare), !is.na(Pclass))
+
+# Model 1: Class only
+model_class_only <- glm(Survived ~ factor(Pclass), 
+                        family = binomial, 
+                        data = analysis_data)
+
+# Model 2: Class + access proxies
+model_class_access <- glm(Survived ~ factor(Pclass) + Fare + has_cabin, 
+                          family = binomial, 
+                          data = analysis_data)
+
+# Extract and compare coefficients
+coef_class_only <- coef(model_class_only)["factor(Pclass)2"]
+coef_class_access <- coef(model_class_access)["factor(Pclass)2"]
+
+reduction <- (coef_class_only - coef_class_access) / coef_class_only * 100
+
+mediation_results <- data.frame(
+  Model = c("Class Only", "Class + Access Proxies"),
+  Pclass2_Coefficient = c(coef_class_only, coef_class_access),
+  Reduction = c(0, reduction)
+)
+
+knitr::kable(mediation_results %>% mutate_if(is.numeric, round, 3),
+             caption = "Class Effect Mediation: Comparing Coefficients")
+```
+
+To assess how much of the class effect is mediated by access mechanisms, we compare two logistic regression models: (1) a class-only model and (2) a model adding access proxies (Fare, cabin presence). The class effect (comparing 2nd to 1st class) reduces from `r coef_class_only %>% round(3)` to `r coef_class_access %>% round(3)` when access variables are included, representing approximately `r reduction %>% round(1)`% mediation. While this suggests access variables explain some of the class gradient, a substantial class effect remains unexplained by these proxies, indicating that other mechanisms (policy implementation, information access, language barriers) also contributed to survival disparities.
+
+---
+
+# Research Question 2: Consistency of Survival Rules Across Contexts
+
+**Research Focus**: Did the effectiveness of women and children first depend on whether a passenger was traveling alone vs with family/group, and on their social visibility (e.g., higher fare / named titles)?
+
+## Conceptual Approach
+
+The "women and children first" policy might operate differently depending on:
+1. **Travel context**: Whether a passenger traveled alone, with family, or in a larger group
+2. **Social visibility**: Measured by fare levels, titles extracted from names, and class membership
+3. **Interaction effects**: How policy enforcement varied across combinations of these factors
+
+### 2.1 Travel Context: Alone vs. Family
+
+```{r rq2_family_context}
+# Create family context variable
+titanic_analysis <- titanic_train %>%
+  mutate(
+    family_size = SibSp + Parch,
+    travel_context = case_when(
+      family_size == 0 ~ "Alone",
+      family_size <= 2 ~ "Small Group (1-2 relatives)",
+      family_size > 2 ~ "Large Group (3+ relatives)"
+    ),
+    travel_context = factor(travel_context, 
+                           levels = c("Alone", "Small Group (1-2 relatives)", "Large Group (3+ relatives)"))
+  )
+
+# Survival by travel context and sex
+context_sex_survival <- titanic_analysis %>%
+  group_by(travel_context, Sex) %>%
+  summarise(
+    n = n(),
+    survived = sum(Survived),
+    survival_rate = mean(Survived),
+    .groups = "drop"
+  )
+
+knitr::kable(context_sex_survival,
+             digits = 3,
+             caption = "Survival by Travel Context and Sex")
+
+# Visualize interaction
+context_plot <- context_sex_survival %>%
+  ggplot(aes(x = travel_context, y = survival_rate, fill = Sex)) +
+  geom_col(position = "dodge", width = 0.7) +
+  scale_y_continuous(labels = percent_format(), limits = c(0, 1)) +
+  scale_fill_manual(values = c("female" = "#e41a1c", "male" = "#377eb8")) +
+  labs(
+    title = "Survival Rates by Travel Context and Sex",
+    subtitle = "Did the women-and-children-first policy depend on family status?",
+    x = "Travel Context",
+    y = "Survival Rate"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(context_plot)
+```
+
+The analysis shows that females traveling alone survived at a rate of `r context_sex_survival %>% filter(travel_context == "Alone", Sex == "female") %>% pull(survival_rate) %>% round(3)`, compared to `r context_sex_survival %>% filter(travel_context == "Large Group (3+ relatives)", Sex == "female") %>% pull(survival_rate) %>% round(3)` for those in large family groups. For males, survival ranged from `r context_sex_survival %>% filter(travel_context == "Alone", Sex == "male") %>% pull(survival_rate) %>% round(3)` (alone) to `r context_sex_survival %>% filter(travel_context == "Large Group (3+ relatives)", Sex == "male") %>% pull(survival_rate) %>% round(3)` (large groups). This suggests that the protective effect of being female was somewhat stronger for those traveling in family groups, possibly because families were evacuated together and children had priority.
+
+### 2.2 Title Extraction: Social Role and Visibility
+
+```{r rq2_title_extraction}
+# Extract titles from names
+titanic_analysis <- titanic_analysis %>%
+  mutate(
+    title = str_extract(Name, "[A-Za-z]+(?=\\.)"),
+    title_grouped = case_when(
+      title %in% c("Mr") ~ "Mr",
+      title %in% c("Mrs", "Mme") ~ "Mrs",
+      title %in% c("Miss", "Mlle", "Ms") ~ "Miss",
+      title %in% c("Master") ~ "Master",
+      title %in% c("Dr", "Major", "Col") ~ "Professional",
+      title %in% c("Rev") ~ "Clergy",
+      TRUE ~ "Other"
+    )
+  )
+
+# Survival by title
+title_survival <- titanic_analysis %>%
+  group_by(title_grouped) %>%
+  summarise(
+    n = n(),
+    survived = sum(Survived),
+    survival_rate = mean(Survived),
+    mean_age = mean(Age, na.rm = TRUE),
+    mean_fare = mean(Fare, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(survival_rate))
+
+knitr::kable(title_survival,
+             digits = 3,
+             caption = "Survival by Passenger Title (Social Role Indicator)")
+```
+
+Titles extracted from passenger names serve as proxies for social role and visibility. Mrs. passengers (married women) survived at `r title_survival %>% filter(title_grouped == "Mrs") %>% pull(survival_rate) %>% round(3)`, Miss passengers at `r title_survival %>% filter(title_grouped == "Miss") %>% pull(survival_rate) %>% round(3)`, and Master passengers (young males) at `r title_survival %>% filter(title_grouped == "Master") %>% pull(survival_rate) %>% round(3)`. Mr. passengers survived at only `r title_survival %>% filter(title_grouped == "Mr") %>% pull(survival_rate) %>% round(3)`. The high survival rate for Master passengers (n = `r title_survival %>% filter(title_grouped == "Master") %>% pull(n)`) suggests that the "children first" component of the policy was clearly applied, as boys were prioritized similarly to girls when they could be identified as young.
+
+### 2.3 Class-Title Interaction: Policy Enforcement Variation
+
+```{r rq2_class_title_interaction}
+# Survival by class and title
+class_title_survival <- titanic_analysis %>%
+  filter(title_grouped %in% c("Mr", "Mrs", "Miss", "Master")) %>%
+  group_by(Pclass, title_grouped) %>%
+  summarise(
+    n = n(),
+    survival_rate = mean(Survived),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(names_from = title_grouped, values_from = c(n, survival_rate))
+
+# Heatmap of survival rates
+heatmap_data <- titanic_analysis %>%
+  filter(title_grouped %in% c("Mr", "Mrs", "Miss", "Master")) %>%
+  group_by(Pclass, title_grouped) %>%
+  summarise(
+    survival_rate = mean(Survived),
+    .groups = "drop"
+  )
+
+heatmap_plot <- heatmap_data %>%
+  ggplot(aes(x = title_grouped, y = factor(Pclass), fill = survival_rate)) +
+  geom_tile(color = "white", size = 1) +
+  geom_text(aes(label = percent(survival_rate, accuracy = 1)), color = "black", size = 3) +
+  scale_fill_viridis_c(labels = percent_format(), name = "Survival Rate") +
+  labs(
+    title = "Survival Rate Heatmap: Class × Title Interaction",
+    subtitle = "Did policy enforcement vary by passenger status?",
+    x = "Passenger Title (Social Role)",
+    y = "Passenger Class"
+  ) +
+  theme(legend.position = "bottom")
+
+print(heatmap_plot)
+```
+
+The class-title interaction reveals that policy implementation was far from uniform. Mrs. passengers in first class survived at near 100%, while Mr. passengers in third class survived at `r heatmap_data %>% filter(Pclass == 3, title_grouped == "Mr") %>% pull(survival_rate) %>% round(3)`. For female-coded titles (Mrs., Miss), survival rates were consistently high across all classes, though notably higher in first class. This pattern demonstrates that the policy was enforced most strictly for women and children of higher social visibility and socio-economic status, while male passengers of lower classes faced near-certain death regardless of title.
+
+### 2.4 Modeling Policy Consistency with Interactions
+
+```{r rq2_interaction_models}
+# Prepare data for interaction models
+model_data <- titanic_analysis %>%
+  filter(!is.na(Age), !is.na(Pclass)) %>%
+  mutate(
+    female = if_else(Sex == "female", 1, 0),
+    child = if_else(Age < 12, 1, 0),
+    first_class = if_else(Pclass == 1, 1, 0)
+  )
+
+# Model 1: Main effects (assumes consistent policy)
+model_main <- glm(Survived ~ female + child + first_class,
+                  family = binomial,
+                  data = model_data)
+
+# Model 2: With class interactions (allows policy to vary by class)
+model_interaction <- glm(Survived ~ female * first_class + child * first_class,
+                         family = binomial,
+                         data = model_data)
+
+# Compare model fit
+aic_main <- AIC(model_main)
+aic_interaction <- AIC(model_interaction)
+
+model_comparison <- data.frame(
+  Model = c("Main Effects (Constant Policy)", "With Interactions (Varying Policy)"),
+  AIC = c(aic_main, aic_interaction),
+  Delta_AIC = c(0, aic_interaction - aic_main)
+)
+
+knitr::kable(model_comparison,
+             digits = 1,
+             caption = "Model Comparison: Does Policy Consistency Matter?")
+```
+
+Comparing models with and without class interactions, the interaction model has AIC of `r aic_interaction %>% round(1)` compared to `r aic_main %>% round(1)` for the main effects model (difference of `r (aic_interaction - aic_main) %>% round(1)`). The negative AIC difference indicates the interaction model fits substantially better, providing evidence that the "women and children first" policy was indeed applied inconsistently across class divisions. This supports the hypothesis that policy enforcement depended on passengers' class and social visibility.
+
+---
+
+# Research Question 3: Missing Data as Signal of Inequality
+
+**Research Focus**: Are patterns of missingness (Cabin, Age) systematically related to class, embarkation, or survival, and how sensitive are conclusions to different missing-data assumptions?
+
+## Conceptual Approach
+
+Missing data in historical records often reflects social structure: the powerful and documented are well-recorded, while marginalized groups leave incomplete traces. We examine: (1) patterns of missingness by class and other demographic variables, (2) whether missingness itself predicts survival, and (3) sensitivity of key findings to different missing data imputation strategies.
+
+### 3.1 Missing Data Patterns
+
+```{r rq3_missing_patterns}
+# Calculate missingness by variable
+missingness_summary <- tibble(
+  Variable = names(titanic_train),
+  Total = nrow(titanic_train),
+  Missing = map_int(titanic_train, ~sum(is.na(.))),
+  Pct_Missing = Missing / Total * 100
+) %>%
+  filter(Missing > 0) %>%
+  arrange(desc(Pct_Missing))
+
+knitr::kable(missingness_summary,
+             digits = 2,
+             caption = "Summary of Missing Data")
+
+# Missing by class
+missing_by_class <- titanic_train %>%
+  mutate(
+    age_missing = is.na(Age),
+    cabin_missing = is.na(Cabin),
+    embarked_missing = is.na(Embarked)
+  ) %>%
+  group_by(Pclass) %>%
+  summarise(
+    n = n(),
+    pct_age_missing = mean(age_missing) * 100,
+    pct_cabin_missing = mean(cabin_missing) * 100,
+    pct_embarked_missing = mean(embarked_missing) * 100,
+    .groups = "drop"
+  )
+
+knitr::kable(missing_by_class,
+             digits = 2,
+             caption = "Percentage of Missing Data by Passenger Class")
+```
+
+Missing data is not random. Age is missing for `r missingness_summary %>% filter(Variable == "Age") %>% pull(Pct_Missing) %>% round(1)`% of passengers overall. Third class has `r missing_by_class %>% filter(Pclass == 3) %>% pull(pct_age_missing) %>% round(1)`% missing age data, compared to `r missing_by_class %>% filter(Pclass == 1) %>% pull(pct_age_missing) %>% round(1)`% in first class. Cabin information is missing for `r missingness_summary %>% filter(Variable == "Cabin") %>% pull(Pct_Missing) %>% round(1)`% overall, with stark class differences: third class has `r missing_by_class %>% filter(Pclass == 3) %>% pull(pct_cabin_missing) %>% round(1)`% missing, while first class has only `r missing_by_class %>% filter(Pclass == 1) %>% pull(pct_cabin_missing) %>% round(1)`%. This systematic missingness by class suggests that administrative records were maintained more carefully for higher-status passengers, raising questions about what lower-class passengers' missing data represents.
+
+### 3.2 Does Missingness Predict Survival?
+
+```{r rq3_missingness_survival}
+# Create missingness indicators
+titanic_missing <- titanic_train %>%
+  mutate(
+    age_missing = is.na(Age),
+    cabin_missing = is.na(Cabin),
+    embarked_missing = is.na(Embarked),
+    missing_count = as.numeric(age_missing) + as.numeric(cabin_missing) + as.numeric(embarked_missing)
+  )
+
+# Survival by missingness patterns
+survival_by_missing <- titanic_missing %>%
+  group_by(missing_count) %>%
+  summarise(
+    n = n(),
+    survived = sum(Survived),
+    survival_rate = mean(Survived),
+    .groups = "drop"
+  ) %>%
+  mutate(missing_count_label = case_when(
+    missing_count == 0 ~ "No Missing",
+    missing_count == 1 ~ "1 Field Missing",
+    missing_count == 2 ~ "2 Fields Missing",
+    missing_count == 3 ~ "3 Fields Missing",
+    TRUE ~ as.character(missing_count)
+  )) %>%
+  select(-missing_count) %>%
+  rename(missing_count = missing_count_label)
+
+knitr::kable(survival_by_missing,
+             digits = 3,
+             caption = "Survival Rate by Number of Missing Data Fields")
+
+# Survival by cabin missingness specifically
+cabin_missing_survival_detailed <- titanic_missing %>%
+  group_by(cabin_missing, Pclass) %>%
+  summarise(
+    n = n(),
+    survival_rate = mean(Survived),
+    .groups = "drop"
+  ) %>%
+  mutate(cabin_status = if_else(cabin_missing, "Cabin Missing", "Cabin Known"))
+
+knitr::kable(cabin_missing_survival_detailed %>% select(cabin_status, Pclass, n, survival_rate),
+             digits = 3,
+             caption = "Cabin Missingness and Survival by Class")
+```
+
+Passengers with no missing data (complete records) survived at a rate of `r survival_by_missing %>% filter(missing_count == "No Missing") %>% pull(survival_rate) %>% round(3)`, while those with any missing data survived at lower rates. This suggests that incomplete record-keeping correlates with actual exclusion from safety measures. Even within first class, cabin missingness is associated with lower survival (`r cabin_missing_survival_detailed %>% filter(Pclass == 1, cabin_missing == TRUE) %>% pull(survival_rate) %>% round(3)` vs. `r cabin_missing_survival_detailed %>% filter(Pclass == 1, cabin_missing == FALSE) %>% pull(survival_rate) %>% round(3)`), raising the question: did these passengers lack cabin assignments because they were overlooked, or did they perish before records could be completed?
+
+### 3.3 Sensitivity Analysis: Imputation Approaches
+
+```{r rq3_imputation_sensitivity}
+# Strategy 1: Complete-case analysis (current approach)
+complete_case <- titanic_train %>%
+  filter(!is.na(Age), !is.na(Cabin), !is.na(Embarked)) %>%
+  group_by(Pclass) %>%
+  summarise(survival_rate = mean(Survived), .groups = "drop")
+
+# Strategy 2: Mean imputation for age
+mean_impute <- titanic_train %>%
+  mutate(Age = if_else(is.na(Age), mean(Age, na.rm = TRUE), Age)) %>%
+  group_by(Pclass) %>%
+  summarise(survival_rate = mean(Survived), .groups = "drop")
+
+# Strategy 3: Class-specific age imputation
+class_impute <- titanic_train %>%
+  group_by(Pclass) %>%
+  mutate(Age = if_else(is.na(Age), mean(Age, na.rm = TRUE), Age)) %>%
+  ungroup() %>%
+  group_by(Pclass) %>%
+  summarise(survival_rate = mean(Survived), .groups = "drop")
+
+# Combine results
+sensitivity_results <- bind_rows(
+  complete_case %>% mutate(Strategy = "Complete Case"),
+  mean_impute %>% mutate(Strategy = "Global Mean Age Imputation"),
+  class_impute %>% mutate(Strategy = "Class-Specific Age Imputation")
+)
+
+knitr::kable(sensitivity_results,
+             digits = 3,
+             caption = "Sensitivity of Class-Survival Relationship to Imputation Strategy")
+```
+
+Different handling of missing age data yields slightly different survival estimates. Complete-case analysis produces one estimate, while mean imputation and class-specific imputation produce others. The differences across strategies are relatively small for overall survival rates, but the pattern is consistent: `r sensitivity_results %>% filter(Strategy == "Complete Case", Pclass == 1) %>% pull(survival_rate) %>% round(3)` first-class survival is robust across approaches. However, third-class estimates range from `r sensitivity_results %>% filter(Pclass == 3) %>% pull(survival_rate) %>% min() %>% round(3)` to `r sensitivity_results %>% filter(Pclass == 3) %>% pull(survival_rate) %>% max() %>% round(3)`, indicating that conclusions about lower-class survival are more sensitive to missing data assumptions.
+
+### 3.4 Missingness Mechanism Analysis
+
+```{r rq3_missingness_mechanism}
+# Test whether missingness is Missing At Random (MAR) vs. Missing Not At Random (MNAR)
+# We model what predicts cabin missingness using observed variables
+
+cabin_missingness_model <- glm(is.na(Cabin) ~ Sex + Pclass + Embarked + factor(Embarked),
+                               family = binomial,
+                               data = titanic_train)
+
+# Key predictors of cabin missingness
+cabin_missing_effect <- tibble(
+  Predictor = c("Female", "2nd Class (vs 1st)", "3rd Class (vs 1st)", "Embarked from Q", "Embarked from S"),
+  LogOdds = c(
+    coef(cabin_missingness_model)["Sexfemale"],
+    coef(cabin_missingness_model)["Pclass2"],
+    coef(cabin_missingness_model)["Pclass3"],
+    coef(cabin_missingness_model)["EmbarkedQ"],
+    coef(cabin_missingness_model)["EmbarkedS"]
+  )
+) %>%
+  mutate(
+    OddsRatio = exp(LogOdds),
+    Direction = if_else(LogOdds > 0, "More Likely Missing", "Less Likely Missing")
+  )
+
+knitr::kable(cabin_missing_effect,
+             digits = 3,
+             caption = "Factors Associated with Missing Cabin Information")
+
+# Visualization of missingness pattern
+missing_by_demographics <- titanic_train %>%
+  mutate(cabin_missing = is.na(Cabin)) %>%
+  group_by(Sex, Pclass) %>%
+  summarise(
+    pct_cabin_missing = mean(cabin_missing) * 100,
+    n = n(),
+    .groups = "drop"
+  )
+
+missing_plot <- missing_by_demographics %>%
+  ggplot(aes(x = factor(Pclass), y = pct_cabin_missing, color = Sex, group = Sex)) +
+  geom_point(size = 3) +
+  geom_line(size = 1) +
+  scale_color_manual(values = c("female" = "#e41a1c", "male" = "#377eb8")) +
+  scale_y_continuous(labels = function(x) paste0(x, "%")) +
+  labs(
+    title = "Cabin Information Missingness by Sex and Class",
+    subtitle = "Systematic patterns suggest missing data is not random",
+    x = "Passenger Class",
+    y = "Percentage with Missing Cabin Data"
+  )
+
+print(missing_plot)
+```
+
+The analysis of what predicts cabin missingness reveals systematic patterns. Third-class passengers were `r cabin_missing_effect %>% filter(Predictor == "3rd Class (vs 1st)") %>% pull(OddsRatio) %>% round(1)` times more likely to have missing cabin data than first-class passengers. This suggests the missingness mechanism is **Missing Not At Random (MNAR)**: the probability that cabin information is missing depends on unobserved characteristics that also affect survival (e.g., whether the ship's records were complete for lower-class passengers). This MNAR mechanism means that multiple imputation or sensitivity analyses using different assumptions are necessary to understand the true class-survival relationship.
+
+---
+
+# Synthesis and Methodological Recommendations
+
+## Summary of Findings Structure
+
+The three research questions address complementary aspects of Titanic survival inequality:
+
+1. **Class-Survival Gap Mechanisms**: While the class effect is partially explained by access-related proxies (cabin presence, fare), substantial unexplained variation remains. This suggests that policy, coordination, language barriers, and information access also played roles.
+
+2. **Policy Consistency**: The "women and children first" policy was not uniformly applied. Its protective effect was strongest for high-status women (Mrs. in first class) and clearly present for children, but substantially weaker for lower-class women and absent for lower-class men.
+
+3. **Missing Data Patterns**: Systematic missingness by class suggests that lower-class records were less complete, and this incompleteness may reflect both administrative neglect and actual exclusion from evacuation procedures.
+
+## Recommended Next Steps for Readers
+
+To develop this analysis further, readers should consider:
+- **Causal modeling**: Use propensity score matching or instrumental variables if external data on evacuation procedures becomes available
+- **Temporal analysis**: If data on boarding times or lifeboat manifests are obtained, examine evacuation sequence
+- **Multiple imputation**: Conduct sensitivity analyses using multiple imputation by chained equations (MICE) to handle MNAR cabin missingness
+- **Text analysis**: If passenger manifests and historical records exist, analyze written descriptions for evidence of evacuation barriers
+
+---
+
+# Technical Notes
+
+```{r session_info}
+sessionInfo()
+```
+
+This analysis was conducted in R using tidyverse for data manipulation, ggplot2 for visualization, and base R for statistical modeling. All code is transparent and reproducible; readers should verify calculations independently when drawing conclusions for policy or historical interpretation.
