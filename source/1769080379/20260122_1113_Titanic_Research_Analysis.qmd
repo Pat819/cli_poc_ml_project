@@ -1,0 +1,729 @@
+---
+title: "Titanic Survival Analysis: Class, Access, and Inequality"
+author: "CLI Copilot"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    self-contained: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Introduction
+
+This report examines three interconnected research questions about survival patterns on the Titanic:
+
+1. **Class and Access**: To what extent is the survival advantage of 1st class passengers mediated by location/access constraints versus explicit priority rules?
+2. **Consistency of Rules**: Were survival protocols (particularly "women and children first") applied uniformly across passenger groups, or did they vary based on social visibility and travel context?
+3. **Missing Data as Signal**: Are patterns of missing data systematically related to class and other characteristics, and how do different missing-data assumptions affect our conclusions?
+
+This analysis uses the Titanic dataset with features including passenger class, gender, age, family context, fare, cabin location, and port of embarkation. The goal is to design analytical approaches that help answer these questions rather than provide definitive conclusions—allowing readers to draw their own inferences based on evidence.
+
+---
+
+# Data Preparation and Exploration
+
+## Loading and Initial Assessment
+
+```{r setup-packages}
+library(tidyverse)
+library(knitr)
+library(gridExtra)
+library(patchwork)
+
+# Load training data
+titanic <- read_csv("/Users/patrickl/Developer/Personal-Repo/cli_poc_ml_project/data/train.csv", show_col_types = FALSE)
+
+# Display basic structure
+cat("Dataset dimensions:", nrow(titanic), "rows,", ncol(titanic), "columns\n")
+cat("\nVariable types and missing values:\n")
+summary_info <- tibble(
+  Variable = names(titanic),
+  Type = sapply(titanic, function(x) class(x)[1]),
+  Missing = sapply(titanic, function(x) sum(is.na(x))),
+  Missing_Pct = round(100 * sapply(titanic, function(x) sum(is.na(x))) / nrow(titanic), 2)
+)
+print(summary_info)
+```
+
+This code chunk loads the Titanic dataset and provides an overview of data structure and completeness. Understanding the dimensions and missing-data patterns at the outset is essential for all three research questions: (1) missing cabin data may reflect class-based access differences, (2) missing age data may correlate with passenger visibility, and (3) missingness itself is a methodological concern we must quantify. The summary immediately reveals which variables have substantial missing data and allows us to plan imputation or sensitivity analyses accordingly.
+
+## Outcome and Key Variables Summary
+
+```{r descriptive-stats}
+# Overall survival rate
+overall_survival <- mean(titanic$Survived, na.rm = TRUE)
+
+# Key descriptive statistics
+desc_stats <- tibble(
+  "Total Passengers" = nrow(titanic),
+  "Survived" = sum(titanic$Survived == 1),
+  "Did Not Survive" = sum(titanic$Survived == 0),
+  "Survival Rate (%)" = round(100 * overall_survival, 2),
+  "Female Count" = sum(titanic$Sex == "female"),
+  "Male Count" = sum(titanic$Sex == "male"),
+  "Median Age" = median(titanic$Age, na.rm = TRUE),
+  "Median Fare" = median(titanic$Fare, na.rm = TRUE)
+)
+
+kable(desc_stats, caption = "Overall Dataset Summary")
+
+# Class distribution
+class_dist <- titanic %>%
+  group_by(Pclass) %>%
+  summarise(
+    Count = n(),
+    Survival_Count = sum(Survived == 1),
+    Survival_Rate = round(100 * mean(Survived), 2),
+    .groups = 'drop'
+  )
+
+kable(class_dist, caption = "Survival by Ticket Class")
+```
+
+This code provides foundational descriptive statistics: overall survival rate of `r round(100 * overall_survival, 2)`%, gender distribution, and age/fare medians. The class-specific survival rates immediately highlight the core phenomenon we must investigate: a dramatic survival gap across classes. This sets the stage for Research Question 1, as we need to understand whether this gap is due to physical location on the ship (access) or explicit priority rules (policy). The descriptive statistics serve as anchor points—all subsequent analyses reference these baseline patterns.
+
+## Feature Engineering: Titles and Family Context
+
+```{r extract-titles}
+# Extract title from passenger name
+titanic <- titanic %>%
+  mutate(
+    Title = str_extract(Name, "[A-Za-z]+(?=\\.)"),
+    # Group rare titles
+    Title_Group = case_when(
+      Title %in% c("Mr", "Mrs", "Miss", "Master") ~ Title,
+      TRUE ~ "Rare"
+    ),
+    # Family size from SibSp + Parch
+    FamilySize = SibSp + Parch,
+    # Travel context: alone vs with family
+    TravelContext = case_when(
+      FamilySize == 0 ~ "Alone",
+      FamilySize <= 2 ~ "Small_Family",
+      TRUE ~ "Large_Family"
+    ),
+    # Cabin letter (deck proxy)
+    CabinLetter = str_extract(Cabin, "[A-Z]"),
+    # Indicator for missing cabin
+    CabinMissing = is.na(Cabin),
+    # Indicator for missing age
+    AgeMissing = is.na(Age),
+    # Age category for missing-data analysis
+    AgeCategory = case_when(
+      is.na(Age) ~ "Missing",
+      Age < 13 ~ "Child",
+      Age < 60 ~ "Adult",
+      TRUE ~ "Elderly"
+    )
+  )
+
+# Show title distribution
+title_summary <- titanic %>%
+  group_by(Title_Group, Sex) %>%
+  summarise(
+    Count = n(),
+    Survival_Rate = round(100 * mean(Survived), 2),
+    .groups = 'drop'
+  ) %>%
+  arrange(desc(Count))
+
+kable(title_summary, caption = "Title Distribution by Gender and Survival")
+```
+
+This feature engineering step creates three key variables for Research Question 2. **Title_Group** serves as a proxy for social role and visibility—titles like "Master" (young boys) and "Mrs" may trigger different priority applications. **TravelContext** (alone vs. family) tests whether norms were applied differently based on coordination requirements. **CabinLetter** represents physical location on the ship, which is crucial for Research Question 1's access hypothesis. These engineered features allow us to test whether women-and-children-first was truly universal or dependent on social context. By including both engineered variables and their missing-data indicators (CabinMissing, AgeMissing), we prepare for Research Question 3's analysis of inequality in recordkeeping.
+
+---
+
+# Research Question 1: Class and Access vs. Policy
+
+## Analytical Strategy
+
+The first research question asks: Is the class-survival gap driven by **access/location constraints** (e.g., cabin proximity to lifeboats) or **policy priority** (e.g., women-and-children-first applied more strictly in 1st class)? To address this, we will compare models with increasing levels of "access proxies" and quantify how the class effect shrinks as we add these variables.
+
+### Mediation Analysis Setup
+
+```{r mediation-setup}
+# Prepare data for mediation analysis
+# Remove rows with missing Age (we'll revisit this in RQ3)
+titanic_complete <- titanic %>%
+  filter(!is.na(Age), !is.na(Embarked))
+
+# Model 1: Class-only effect (total effect)
+model_1 <- glm(Survived ~ factor(Pclass), 
+               family = binomial(), 
+               data = titanic_complete)
+
+# Model 2: Class + Sex/Age (explicit priority rules)
+model_2 <- glm(Survived ~ factor(Pclass) + Sex + Age, 
+               family = binomial(), 
+               data = titanic_complete)
+
+# Model 3: Add access proxies (Fare as wealth/location, Embarked)
+model_3 <- glm(Survived ~ factor(Pclass) + Sex + Age + Fare + factor(Embarked), 
+               family = binomial(), 
+               data = titanic_complete)
+
+# Model 4: Add cabin information (strongest access proxy)
+titanic_cabin <- titanic_complete %>%
+  filter(!is.na(CabinLetter))
+
+model_4 <- glm(Survived ~ factor(Pclass) + Sex + Age + Fare + 
+                 factor(Embarked) + factor(CabinLetter), 
+               family = binomial(), 
+               data = titanic_cabin)
+
+# Extract class effects
+get_class_effects <- function(model) {
+  coefs <- coef(model)
+  # Class 1 is reference; extract Class 2 and Class 3 effects
+  effects <- tibble(
+    Class_2_Effect = round(coefs["factor(Pclass)2"], 4),
+    Class_3_Effect = round(coefs["factor(Pclass)3"], 4)
+  )
+  return(effects)
+}
+
+class_effects <- bind_rows(
+  tibble(Model = "Class Only", get_class_effects(model_1)),
+  tibble(Model = "Class + Sex + Age", get_class_effects(model_2)),
+  tibble(Model = "Class + Sex + Age + Fare + Embarked", get_class_effects(model_3)),
+  tibble(Model = "Class + Sex + Age + Fare + Embarked + Cabin", get_class_effects(model_4))
+)
+
+kable(class_effects, 
+      caption = "Change in Class Effects Across Models: Mediation Progression",
+      digits = 4)
+```
+
+This analytical sequence tests mediation step-by-step. **Model 1** captures the total class effect on survival. **Model 2** controls for gender and age—variables directly tied to explicit evacuation priority—allowing us to see how much "women and children first" explains the class gap. **Model 3** adds fare and embarkation point, which are less direct but may capture wealth-related advantages in accessing lifeboats. **Model 4** adds cabin letter, the most direct proxy for physical location on the ship. If the class effect shrinks substantially when we add access proxies (Models 3–4) but not when we add priority variables (Model 2), it suggests location matters more than policy. Conversely, if the effect shrinks most at Model 2, explicit rules dominated. The coefficient sizes let us quantify mediation: larger reductions suggest stronger mediation by that pathway.
+
+### Visualization of Class Effects Progression
+
+```{r plot-class-effects}
+# Predicted survival by class, basic model
+pred_model1 <- tibble(Pclass = c(1, 2, 3)) %>%
+  mutate(Predicted = predict(model_1, newdata = ., type = "response"))
+
+# Observed survival by class
+observed_survival <- titanic_complete %>%
+  group_by(Pclass) %>%
+  summarise(
+    Observed = mean(Survived),
+    Count = n(),
+    .groups = 'drop'
+  )
+
+# Combine and plot
+survival_comparison <- pred_model1 %>%
+  left_join(observed_survival, by = "Pclass") %>%
+  pivot_longer(c(Predicted, Observed), names_to = "Type", values_to = "Rate") %>%
+  mutate(
+    Pclass_label = case_when(
+      Pclass == 1 ~ "1st Class",
+      Pclass == 2 ~ "2nd Class",
+      TRUE ~ "3rd Class"
+    ),
+    Pclass_label = factor(Pclass_label, levels = c("1st Class", "2nd Class", "3rd Class"))
+  )
+
+p_class_survival <- ggplot(survival_comparison, aes(x = Pclass_label, y = Rate, fill = Type)) +
+  geom_bar(stat = "identity", position = "dodge", alpha = 0.8) +
+  scale_fill_manual(values = c("Observed" = "#1f77b4", "Predicted" = "#ff7f0e")) +
+  labs(
+    title = "Class-Based Survival: Observed vs. Model Predictions",
+    x = "Ticket Class",
+    y = "Survival Rate",
+    fill = "Type",
+    caption = "Predicted rates from class-only model; Observed = actual survival"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold", size = 12)
+  ) +
+  ylim(0, 1)
+
+print(p_class_survival)
+```
+
+This visualization displays the class effect across groups. By comparing observed and predicted survival rates from the class-only model, we see the magnitude of the gap we are trying to explain. Subsequent models (incorporating sex, fare, cabin, etc.) will progressively explain portions of this gap, allowing us to infer the relative importance of access versus policy.
+
+### Statistical Summary of Mediation
+
+```{r mediation-summary}
+# Calculate key metrics for mediation assessment
+# For simplicity, we use log-odds (coefficients) as our effect measures
+
+mediation_summary <- tibble(
+  Model = c(
+    "Class Only",
+    "Class + Sex/Age (Priority)",
+    "Class + Fare/Embarked (Access Weak)",
+    "Class + Cabin (Access Strong)"
+  ),
+  Interpretation = c(
+    "Total effect of class",
+    "Effect controlling for explicit priority rules",
+    "Effect controlling for economic/embarkation proxies",
+    "Effect controlling for cabin location (strongest access proxy)"
+  ),
+  Focus = c(
+    "Baseline",
+    "Tests: Do priority rules explain the gap?",
+    "Tests: Do economic/location proxies explain the gap?",
+    "Tests: Does cabin location explain the gap?"
+  )
+)
+
+kable(mediation_summary, 
+      caption = "Mediation Analysis: Sequential Model Building to Test Access vs. Policy",
+      col.names = c("Model", "Interpretation", "Focal Test"))
+```
+
+This summary table articulates the research logic: each model tests a different mechanism. If adding sex and age (Model 2) causes class coefficients to shrink substantially, it implies priority rules account for much of the class gap. If adding cabin letter (Model 4) produces the largest shrinkage, it indicates physical access was the primary driver. Readers can examine the coefficient table alongside this summary to draw conclusions about which mechanism predominated.
+
+---
+
+# Research Question 2: Consistency of Rules and Social Visibility
+
+## Analytical Strategy
+
+The second research question examines whether "women and children first" and other survival rules were applied uniformly across passenger subgroups, or whether they varied by social visibility (proxied by fare, title), family context (alone vs. with family), and class. We will test interaction effects to reveal whether these norms operated differently under different conditions.
+
+### Testing Gender × Class Interaction
+
+```{r gender-class-interaction}
+# Model with interaction: does being female protect you equally in all classes?
+model_gender_class <- glm(Survived ~ Sex * factor(Pclass) + Age, 
+                          family = binomial(), 
+                          data = titanic_complete)
+
+# Extract interaction coefficients
+summary_gender_class <- summary(model_gender_class)
+coef_table <- as.data.frame(summary_gender_class$coefficients)
+coef_table$Variable <- rownames(coef_table)
+coef_table <- coef_table %>%
+  select(Variable, Estimate, `Std. Error`, `Pr(>|z|)`) %>%
+  arrange(desc(abs(Estimate)))
+
+kable(coef_table, 
+      caption = "Gender × Class Interaction: Does Female Advantage Vary by Class?",
+      digits = 4)
+
+# Predicted probabilities for interpretation
+preds_interaction <- tibble(
+  Sex = rep(c("female", "male"), 3),
+  Pclass = rep(c(1, 2, 3), each = 2),
+  Age = 30
+)
+
+preds_interaction$Predicted_Survival <- predict(model_gender_class, 
+                                               newdata = preds_interaction, 
+                                               type = "response")
+
+preds_interaction <- preds_interaction %>%
+  mutate(
+    Pclass_label = case_when(
+      Pclass == 1 ~ "1st Class",
+      Pclass == 2 ~ "2nd Class",
+      TRUE ~ "3rd Class"
+    )
+  )
+
+kable(preds_interaction %>% select(-Pclass), 
+      caption = "Predicted Survival by Gender and Class (Age = 30)",
+      digits = 4)
+```
+
+This interaction test reveals a critical pattern: **Does being female provide equal protection across all classes, or do higher-class women benefit more from priority rules?** If the female advantage (difference in survival between women and men) is constant across classes, rules were applied uniformly. If it varies—say, larger female advantage in 1st class—it suggests either (1) rules were enforced more strictly in 1st class, or (2) female passengers in lower classes faced additional barriers (crowding, language, access). The coefficient table shows which interactions are statistically significant, guiding our interpretation.
+
+### Visualization of Gender Effects by Class
+
+```{r plot-gender-class}
+# Broader prediction grid for smooth visualization
+pred_grid <- expand_grid(
+  Sex = c("female", "male"),
+  Pclass = c(1, 2, 3),
+  Age = 30
+)
+
+pred_grid$Survival <- predict(model_gender_class, newdata = pred_grid, type = "response")
+
+pred_grid <- pred_grid %>%
+  mutate(
+    Pclass_label = case_when(
+      Pclass == 1 ~ "1st Class",
+      Pclass == 2 ~ "2nd Class",
+      TRUE ~ "3rd Class"
+    ),
+    Pclass_label = factor(Pclass_label, levels = c("1st Class", "2nd Class", "3rd Class"))
+  )
+
+p_gender_class_interaction <- ggplot(pred_grid, aes(x = Pclass_label, y = Survival, 
+                                                     color = Sex, group = Sex)) +
+  geom_line(size = 1) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("female" = "#e41a1c", "male" = "#377eb8")) +
+  labs(
+    title = "Gender × Class: Does Female Advantage Vary by Ticket Class?",
+    x = "Ticket Class",
+    y = "Predicted Survival Probability",
+    color = "Gender",
+    caption = "Predictions at Age = 30. Non-parallel lines indicate class-dependent gender effects."
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold", size = 12)
+  ) +
+  ylim(0, 1)
+
+print(p_gender_class_interaction)
+```
+
+This visualization makes the consistency question explicit: if lines are parallel (both genders show similar class drop), rules were applied similarly across classes. If lines diverge (female advantage widens or narrows with class), it suggests rules were class-dependent. This graph helps readers assess whether priority protocols varied systematically.
+
+### Testing Context Interactions: Title × Pclass × Sex
+
+```{r title-interactions}
+# Focus on passengers with non-rare titles for clearer interpretation
+titanic_main_titles <- titanic_complete %>%
+  filter(Title_Group != "Rare")
+
+# Analyze survival by title, class, and sex
+title_class_survival <- titanic_main_titles %>%
+  group_by(Title_Group, Pclass, Sex) %>%
+  summarise(
+    Count = n(),
+    Survival_Rate = round(100 * mean(Survived), 2),
+    Mean_Age = round(mean(Age, na.rm = TRUE), 1),
+    .groups = 'drop'
+  ) %>%
+  arrange(Title_Group, Pclass)
+
+kable(title_class_survival, 
+      caption = "Survival by Title, Class, and Gender: Testing Visibility Effects",
+      digits = 2)
+```
+
+This table examines whether social role (proxied by title) affected survival chances beyond gender and class alone. **Master** (young boys) and **Miss** (unmarried women) are high-visibility categories; **Mr** (adult men) are low-visibility for survival purposes. If survival rates vary substantially by title within gender-class cells, it suggests rules were sensitive to social context and visibility. For instance, did "Master" (a title marking status and youth) improve boys' chances beyond their age? Did "Mrs" vs. "Miss" matter among women in the same class? These patterns reveal whether rules operated at the granular level of social role.
+
+### Family Context and Crowding Effects
+
+```{r travel-context}
+# Test: did family context affect whether women and children first was observed?
+family_context_analysis <- titanic_complete %>%
+  group_by(TravelContext, Sex, Pclass) %>%
+  summarise(
+    Count = n(),
+    Survival_Rate = round(100 * mean(Survived), 2),
+    Mean_Age = round(mean(Age, na.rm = TRUE), 1),
+    .groups = 'drop'
+  ) %>%
+  arrange(desc(Survival_Rate))
+
+kable(family_context_analysis, 
+      caption = "Survival by Travel Context (Alone, Small/Large Family), Sex, and Class",
+      digits = 2)
+
+# Visualize family context effect
+p_family <- titanic_complete %>%
+  group_by(TravelContext, Sex) %>%
+  summarise(Survival_Rate = mean(Survived), .groups = 'drop') %>%
+  ggplot(aes(x = factor(TravelContext, levels = c("Alone", "Small_Family", "Large_Family")), 
+             y = Survival_Rate, fill = Sex)) +
+  geom_bar(stat = "identity", position = "dodge", alpha = 0.8) +
+  scale_fill_manual(values = c("female" = "#e41a1c", "male" = "#377eb8")) +
+  labs(
+    title = "Travel Context Effect: Do Family Ties Affect Survival Odds?",
+    x = "Travel Context",
+    y = "Survival Rate",
+    fill = "Gender",
+    caption = "Differences in survival by family size may reflect coordination effects or crowding."
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold", size = 12)
+  ) +
+  ylim(0, 1)
+
+print(p_family)
+```
+
+This analysis tests whether the protective effect of being female or a child depended on travel context. The research hypothesis is that in chaotic conditions (crowding, language barriers), individuals traveling with families may have coordinated better for evacuation than those alone. Conversely, families may have been slower to evacuate because they refused to separate. The observed patterns help distinguish between these mechanisms and reveal whether social coordination context affected rule application.
+
+---
+
+# Research Question 3: Missing Data as Signal of Inequality
+
+## Analytical Strategy
+
+The third research question treats missing data as a sociological signal rather than merely a statistical nuisance. We examine whether missing data in key variables (Age, Cabin) is systematically related to class and other characteristics, suggesting that missing data itself reflects historical inequality in record-keeping. We then perform sensitivity analyses to assess how different missing-data assumptions affect conclusions about survival mechanisms.
+
+### Missing Data Pattern Analysis
+
+```{r missing-patterns}
+# Quantify missingness by class
+missing_by_class <- titanic %>%
+  group_by(Pclass) %>%
+  summarise(
+    Count = n(),
+    Age_Missing_Count = sum(is.na(Age)),
+    Age_Missing_Pct = round(100 * sum(is.na(Age)) / n(), 2),
+    Cabin_Missing_Count = sum(is.na(Cabin)),
+    Cabin_Missing_Pct = round(100 * sum(is.na(Cabin)) / n(), 2),
+    Embarked_Missing_Count = sum(is.na(Embarked)),
+    Embarked_Missing_Pct = round(100 * sum(is.na(Embarked)) / n(), 2),
+    .groups = 'drop'
+  )
+
+kable(missing_by_class, 
+      caption = "Missing Data by Passenger Class: Evidence of Unequal Recordkeeping",
+      digits = 2)
+
+# Missing data by gender
+missing_by_gender <- titanic %>%
+  group_by(Sex) %>%
+  summarise(
+    Count = n(),
+    Age_Missing_Pct = round(100 * sum(is.na(Age)) / n(), 2),
+    Cabin_Missing_Pct = round(100 * sum(is.na(Cabin)) / n(), 2),
+    .groups = 'drop'
+  )
+
+kable(missing_by_gender, 
+      caption = "Missing Data by Gender",
+      digits = 2)
+```
+
+This analysis documents systematic patterns of missingness. **Hypothesis**: Higher missingness in lower classes suggests passengers were less thoroughly recorded—perhaps because they were less visible to crew, traveled in different areas, or came from less literate backgrounds. **Cabin missingness** is particularly striking: if most 3rd class passengers lack cabin information, we cannot use cabin location as an access proxy for them, potentially biasing mediation analyses. **Age missingness** may indicate that younger children (more casualties, potentially less visible) or very young infants were less reliably recorded. These patterns reveal how historical inequality manifests in the data itself.
+
+### Visualization of Missingness Patterns
+
+```{r plot-missingness}
+# Prepare data for missingness heatmap by calculating directly
+missingness_by_class_long <- tibble(
+  Pclass = rep(c(1, 2, 3), 4),
+  Variable = rep(c("Age", "Cabin", "Embarked", "Fare"), each = 3),
+  Missing_Pct = c(
+    # Age
+    100 * sum(is.na(titanic[titanic$Pclass == 1, "Age"])) / nrow(titanic[titanic$Pclass == 1, ]),
+    100 * sum(is.na(titanic[titanic$Pclass == 2, "Age"])) / nrow(titanic[titanic$Pclass == 2, ]),
+    100 * sum(is.na(titanic[titanic$Pclass == 3, "Age"])) / nrow(titanic[titanic$Pclass == 3, ]),
+    # Cabin
+    100 * sum(is.na(titanic[titanic$Pclass == 1, "Cabin"])) / nrow(titanic[titanic$Pclass == 1, ]),
+    100 * sum(is.na(titanic[titanic$Pclass == 2, "Cabin"])) / nrow(titanic[titanic$Pclass == 2, ]),
+    100 * sum(is.na(titanic[titanic$Pclass == 3, "Cabin"])) / nrow(titanic[titanic$Pclass == 3, ]),
+    # Embarked
+    100 * sum(is.na(titanic[titanic$Pclass == 1, "Embarked"])) / nrow(titanic[titanic$Pclass == 1, ]),
+    100 * sum(is.na(titanic[titanic$Pclass == 2, "Embarked"])) / nrow(titanic[titanic$Pclass == 2, ]),
+    100 * sum(is.na(titanic[titanic$Pclass == 3, "Embarked"])) / nrow(titanic[titanic$Pclass == 3, ]),
+    # Fare
+    100 * sum(is.na(titanic[titanic$Pclass == 1, "Fare"])) / nrow(titanic[titanic$Pclass == 1, ]),
+    100 * sum(is.na(titanic[titanic$Pclass == 2, "Fare"])) / nrow(titanic[titanic$Pclass == 2, ]),
+    100 * sum(is.na(titanic[titanic$Pclass == 3, "Fare"])) / nrow(titanic[titanic$Pclass == 3, ])
+  )
+) %>%
+  mutate(
+    Pclass_label = case_when(
+      Pclass == 1 ~ "1st Class",
+      Pclass == 2 ~ "2nd Class",
+      TRUE ~ "3rd Class"
+    )
+  )
+
+p_missing <- ggplot(missingness_by_class_long, 
+                    aes(x = Variable, y = Pclass_label, fill = Missing_Pct)) +
+  geom_tile(color = "white", size = 0.5) +
+  scale_fill_viridis_c(direction = 1, name = "Missing %") +
+  labs(
+    title = "Missing Data Patterns by Class",
+    x = "Variable",
+    y = "Ticket Class",
+    caption = "Darker color = higher proportion of missing values. Inequality in recordkeeping is visible."
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 12)
+  )
+
+print(p_missing)
+```
+
+This heatmap visualizes inequality: large blocks of missing cabin data in 3rd class versus complete records in 1st class immediately suggest class-based differences in documentation. Age missingness patterns may also reflect that lower-class passengers were recorded less carefully.
+
+### Sensitivity Analysis: Age Imputation Strategy
+
+```{r sensitivity-age-imputation}
+# Create multiple imputation scenarios to test robustness
+
+# Scenario 1: Complete-case analysis (remove all missing Age)
+scenario_1 <- titanic_complete %>%
+  filter(!is.na(Age))
+
+# Scenario 2: Mean imputation by class and sex
+scenario_2 <- titanic %>%
+  filter(!is.na(Embarked)) %>%
+  group_by(Pclass, Sex) %>%
+  mutate(
+    Age_imputed = case_when(
+      is.na(Age) ~ mean(Age, na.rm = TRUE),
+      TRUE ~ Age
+    )
+  ) %>%
+  ungroup()
+
+# Scenario 3: Set missing age to child (assume missing = young)
+scenario_3 <- titanic %>%
+  filter(!is.na(Embarked)) %>%
+  mutate(
+    Age_imputed = case_when(
+      is.na(Age) ~ 5,  # Assume missing ages were children
+      TRUE ~ Age
+    )
+  )
+
+# Scenario 4: Set missing age to adult (assume missing = adult)
+scenario_4 <- titanic %>%
+  filter(!is.na(Embarked)) %>%
+  mutate(
+    Age_imputed = case_when(
+      is.na(Age) ~ 35,  # Assume missing ages were adults
+      TRUE ~ Age
+    )
+  )
+
+# Fit model under each scenario
+model_s1 <- glm(Survived ~ factor(Pclass) + Sex + Age, 
+                family = binomial(), data = scenario_1)
+model_s2 <- glm(Survived ~ factor(Pclass) + Sex + Age_imputed, 
+                family = binomial(), data = scenario_2)
+model_s3 <- glm(Survived ~ factor(Pclass) + Sex + Age_imputed, 
+                family = binomial(), data = scenario_3)
+model_s4 <- glm(Survived ~ factor(Pclass) + Sex + Age_imputed, 
+                family = binomial(), data = scenario_4)
+
+# Compare sex coefficients (proxy for rule consistency)
+sensitivity_comparison <- tibble(
+  Scenario = c(
+    "1: Complete Case (Remove Missing)",
+    "2: Mean Imputation (by Class/Sex)",
+    "3: Assume Missing = Child",
+    "4: Assume Missing = Adult"
+  ),
+  Sex_Coefficient = c(
+    coef(model_s1)["Sexmale"],
+    coef(model_s2)["Sexmale"],
+    coef(model_s3)["Sexmale"],
+    coef(model_s4)["Sexmale"]
+  ),
+  Sample_Size = c(
+    nrow(scenario_1),
+    nrow(scenario_2),
+    nrow(scenario_3),
+    nrow(scenario_4)
+  )
+)
+
+kable(sensitivity_comparison, 
+      caption = "Sensitivity Analysis: How Do Age Imputation Strategies Affect Gender Effect?",
+      digits = 4)
+```
+
+This sensitivity analysis asks: **Do our conclusions about rule consistency (Research Question 2) change when we make different assumptions about missing age values?** If estimates are stable, our conclusions are robust. If sex coefficients shift substantially under different imputations, it indicates that missing data—and our assumptions about it—materially affect inferences. This is a critical check because missing age values are not random; they may correlate with age itself (e.g., infants under-recorded) or with class. The comparison across scenarios reveals this sensitivity.
+
+### Assessing Bias from Cabin Missingness
+
+```{r cabin-missingness-bias}
+# Compare class effect in subsamples with vs. without cabin data
+# Subsample 1: Only passengers with cabin data
+with_cabin <- titanic %>%
+  filter(!is.na(Age), !is.na(Embarked), !is.na(Cabin))
+
+# Subsample 2: All passengers with age/embarked (including missing cabin)
+all_passengers <- titanic %>%
+  filter(!is.na(Age), !is.na(Embarked))
+
+# Models to compare class effect
+model_with_cabin <- glm(Survived ~ factor(Pclass) + Sex + Age, 
+                        family = binomial(), data = with_cabin)
+model_all <- glm(Survived ~ factor(Pclass) + Sex + Age, 
+                 family = binomial(), data = all_passengers)
+
+# Extract class coefficients
+class_effect_comparison <- tibble(
+  Sample = c("Passengers with Cabin Data", "All Passengers (including missing cabin)"),
+  Sample_Size = c(nrow(with_cabin), nrow(all_passengers)),
+  Class_2_Coef = c(
+    coef(model_with_cabin)["factor(Pclass)2"],
+    coef(model_all)["factor(Pclass)2"]
+  ),
+  Class_3_Coef = c(
+    coef(model_with_cabin)["factor(Pclass)3"],
+    coef(model_all)["factor(Pclass)3"]
+  )
+)
+
+kable(class_effect_comparison, 
+      caption = "Selection Bias from Cabin Missingness: How Does Sample Composition Affect Class Effects?",
+      digits = 4)
+
+# Describe the difference
+survival_by_cabin_missing <- titanic %>%
+  filter(!is.na(Age), !is.na(Embarked)) %>%
+  group_by(CabinMissing, Pclass) %>%
+  summarise(
+    Count = n(),
+    Survival_Rate = round(100 * mean(Survived), 2),
+    .groups = 'drop'
+  )
+
+kable(survival_by_cabin_missing, 
+      caption = "Who Has Missing Cabin Data? Survival by Class and Cabin Missingness",
+      digits = 2)
+```
+
+This analysis directly addresses selection bias: **The subsample with cabin data is not representative of the overall population.** If class effects differ substantially between samples, it means we cannot reliably use cabin-based mediation analyses on the full dataset. Survival rates stratified by cabin missingness reveal the mechanism: missing cabin data is concentrated in 3rd class, and those passengers had systematically different outcomes. This highlights a key limitation for Research Question 1: mediation by cabin location cannot be estimated on the complete sample because the data mechanism is not missing at random.
+
+---
+
+# Summary and Interpretive Guidance
+
+## Key Findings Presented
+
+This report has presented a series of analytical approaches designed to illuminate three interconnected research questions:
+
+1. **Access vs. Policy (RQ1)**: Sequential mediation models allow comparison of how class effects shrink when controlling for priority rules (sex, age) versus access proxies (fare, cabin). Readers can examine coefficient tables to infer which mechanism predominated.
+
+2. **Consistency of Rules (RQ2)**: Interaction models, survival tables by title/context, and family-context visualizations reveal whether women-and-children-first was applied uniformly or varied by class, visibility (title/fare), and travel context. Parallel lines in plots suggest uniformity; divergence suggests context-dependence.
+
+3. **Missing Data as Signal (RQ3)**: Missingness patterns stratified by class demonstrate that gaps in the historical record itself reflect inequality. Sensitivity analyses show how assumptions about missing values affect conclusions—particularly important for RQ1's mediation estimates, which rely on cabin data concentrated in 1st class.
+
+## Logical Reasoning for Decision-Making
+
+Rather than providing definitive conclusions, this report equips readers to reason through the evidence:
+
+- **Examine the mediation table in RQ1**: Does the class coefficient shrink more when sex/age are added (suggesting policy) or when cabin/fare are added (suggesting access)? The magnitude of shrinkage at each step quantifies the relative importance.
+
+- **Review interaction plots in RQ2**: Are lines parallel (rules applied uniformly) or do they diverge (rules vary by context)? Survival tables by title show whether social roles received differential treatment.
+
+- **Consider the sensitivity analyses in RQ3**: Do key findings hold across multiple imputation assumptions? If coefficient estimates shift dramatically, the conclusion is fragile and depends on how you handle missing data.
+
+## Methodological Transparency
+
+All code is visible and reproducible. Every number referenced in accompanying text comes directly from code output, not hardcoded estimates. This approach follows best practices for evidence-based reasoning and allows readers to audit assumptions, refine models, and draw their own conclusions based on the data and analytical designs presented.
+
+---
+
+# Session Information
+
+```{r session-info}
+sessionInfo()
+```
+
