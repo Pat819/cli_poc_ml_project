@@ -1,0 +1,636 @@
+---
+title: "Titanic Survival Analysis: Decomposing the Class-Survival Gap into Access and Constraint Mechanisms"
+author: "CLI Copilot"
+date: "2026-01-23"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    self-contained: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+## Executive Summary
+
+This analysis addresses a critical research question: **How much of the class–survival gap is explained by access and constraints rather than priority rules?** The Titanic disaster provides a unique natural experiment where we can examine whether observable differences in survival rates across passenger classes reflect differential access to survival resources, physical constraints on escape, or explicit prioritization policies. This report outlines a methodological framework to decompose the class-survival relationship into measurable components.
+
+---
+
+## 1. Research Question & Analytical Framework
+
+### 1.1 Understanding the Research Question
+
+The survival patterns during the Titanic disaster are known to differ dramatically by passenger class. However, this disparity could arise from multiple distinct mechanisms:
+
+1. **Priority Rules**: Official policies (e.g., "women and children first") that explicitly granted some groups preferential evacuation
+2. **Access Constraints**: Physical and logistical factors that affected some groups' ability to reach lifeboats (e.g., cabin location, gate barriers)
+3. **Information Access**: Awareness of the disaster and lifeboat locations
+
+Our analytical goal is to isolate which mechanism explains the largest portion of the class-survival relationship. We do this by examining patterns in demographic composition, spatial distribution, and conditional survival probabilities across classes.
+
+### 1.2 Analytical Strategy
+
+We will employ the following approach:
+
+1. **Descriptive Analysis**: Document the raw survival gap by class and basic demographics
+2. **Decomposition Analysis**: Examine whether the class gap persists after controlling for:
+   - Gender composition (proxy for priority rules)
+   - Age distribution (proxy for vulnerability/access constraints)
+   - Family structure (proxy for coordination and evacuation logistics)
+3. **Mechanism-Specific Tests**: Assess whether patterns align with access/constraint hypotheses versus pure priority
+4. **Quantitative Attribution**: Estimate the proportion of the class gap explained by each mechanism
+
+---
+
+## 2. Data Preparation and Exploration
+
+### 2.1 Loading and Initial Exploration
+
+```{r setup}
+library(tidyverse)
+library(knitr)
+library(ggplot2)
+library(scales)
+
+# Load training data
+titanic_raw <- read_csv("../../data/train.csv")
+
+# Display basic structure
+head(titanic_raw)
+dim(titanic_raw)
+```
+
+We begin by loading the Titanic training dataset, which contains passenger information including survival outcome (the dependent variable), class, demographics, and family relationships. Understanding the structure and completeness of this data is essential before proceeding with any analysis, as missing values will affect our ability to examine specific mechanisms.
+
+### 2.2 Data Quality Assessment
+
+```{r data_quality}
+# Check for missing values
+missing_summary <- titanic_raw %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Missing_Count") %>%
+  mutate(Total_N = nrow(titanic_raw),
+         Missing_Pct = round(100 * Missing_Count / Total_N, 2)) %>%
+  arrange(desc(Missing_Count))
+
+knitr::kable(missing_summary, caption = "Missing Values by Variable")
+```
+
+Data quality directly impacts our ability to test mechanisms. Missing values in age, cabin location, and embarked port will limit our analysis of physical access constraints. We document these limitations before proceeding, as they constrain which mechanism-specific hypotheses we can rigorously test.
+
+### 2.3 Variable Preparation
+
+```{r data_prep}
+titanic <- titanic_raw %>%
+  # Create class labels for clarity
+  mutate(
+    Class = factor(Pclass, levels = 1:3, labels = c("1st Class", "2nd Class", "3rd Class")),
+    Survived = factor(Survived, levels = 0:1, labels = c("No", "Yes")),
+    Sex = factor(Sex),
+    # Create age groups for stratified analysis
+    Age_Group = case_when(
+      is.na(Age) ~ "Missing",
+      Age < 13 ~ "Child (<13)",
+      Age < 18 ~ "Teen (13-17)",
+      Age < 65 ~ "Adult (18-64)",
+      TRUE ~ "Elderly (65+)"
+    ),
+    Age_Group = factor(Age_Group, 
+                       levels = c("Child (<13)", "Teen (13-17)", "Adult (18-64)", 
+                                 "Elderly (65+)", "Missing")),
+    # Family size indicator
+    Family_Size = SibSp + Parch + 1,
+    Traveling_Alone = (Family_Size == 1),
+    # Embarked port (with handling for missing)
+    Embarked = factor(Embarked),
+    # Cabin information as access proxy
+    Has_Cabin_Info = !is.na(Cabin)
+  ) %>%
+  select(-Pclass, -Ticket, -Cabin) # Remove redundant/unused variables
+
+glimpse(titanic)
+```
+
+We prepare the data by creating interpretable categorical variables. Class becomes a labeled factor for clarity. Age is grouped to allow examination of whether "women and children first" policy effects are observable. Family size variables help test whether evacuation logistics (coordinating family members) created differential access. Cabin information availability serves as a proxy for explicit passenger tracking versus implicit constraints.
+
+---
+
+## 3. Descriptive Analysis: The Class-Survival Gap
+
+### 3.1 Raw Survival Rates by Class
+
+```{r survival_by_class}
+# Calculate survival proportions by class
+survival_by_class <- titanic %>%
+  group_by(Class) %>%
+  summarise(
+    N = n(),
+    Survived_Count = sum(Survived == "Yes"),
+    Survival_Rate = round(100 * Survived_Count / N, 2),
+    .groups = "drop"
+  )
+
+knitr::kable(survival_by_class, 
+             caption = "Raw Survival Rates by Passenger Class")
+```
+
+This table documents the baseline disparity: survival rates vary substantially across passenger classes. This raw gap is our dependent variable—what we seek to explain through the lens of access constraints versus priority rules.
+
+### 3.2 Visualizing the Class-Survival Gap
+
+```{r plot_class_survival}
+ggplot(survival_by_class, aes(x = Class, y = Survival_Rate, fill = Class)) +
+  geom_col(alpha = 0.8, show.legend = FALSE) +
+  scale_fill_brewer(palette = "Set2") +
+  scale_y_continuous(limits = c(0, 100), labels = function(x) paste0(x, "%")) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    legend.position = "bottom"
+  ) +
+  labs(
+    title = "Survival Rates by Passenger Class",
+    subtitle = "Titanic Disaster - Raw Survival Proportions",
+    x = "Passenger Class",
+    y = "Survival Rate",
+    caption = "Data: Titanic Training Set (n=891)"
+  )
+```
+
+This visualization presents the empirical gap that motivates our analysis. The clear ordering (1st > 2nd > 3rd class) is consistent with both access constraints and explicit prioritization. To distinguish between these mechanisms, we need conditional analyses.
+
+### 3.3 Class Composition and Demographic Imbalance
+
+```{r class_demographics}
+# Examine demographic composition by class
+demo_by_class <- titanic %>%
+  group_by(Class) %>%
+  summarise(
+    N = n(),
+    Female_Pct = round(100 * sum(Sex == "female") / N, 1),
+    Male_Pct = round(100 * sum(Sex == "male") / N, 1),
+    Mean_Age = round(mean(Age, na.rm = TRUE), 1),
+    Child_Pct = round(100 * sum(Age < 13, na.rm = TRUE) / N, 1),
+    Missing_Age_Pct = round(100 * sum(is.na(Age)) / N, 1),
+    .groups = "drop"
+  )
+
+knitr::kable(demo_by_class,
+             caption = "Demographic Composition by Class - Potential Confounders")
+```
+
+This table reveals critical differences in demographic composition across classes. If 1st class passengers were predominantly female and younger, the survival advantage could partly reflect these groups' greater biological vulnerability to drowning (a "natural selection" mechanism) or explicit prioritization of women and children. We must account for these compositional differences when attributing the survival gap to class-specific access or constraints.
+
+### 3.4 Visualizing Demographic Imbalance Across Classes
+
+```{r plot_demo_comparison}
+# Prepare data for visualization
+demo_data <- titanic %>%
+  group_by(Class) %>%
+  mutate(N = n()) %>%
+  group_by(Class, Sex) %>%
+  summarise(
+    N_total = first(N),
+    Count = n(),
+    Proportion = Count / N_total,
+    .groups = "drop"
+  )
+
+ggplot(demo_data, aes(x = Class, y = Proportion, fill = Sex)) +
+  geom_col(position = "stack", alpha = 0.8) +
+  scale_fill_brewer(palette = "Set1") +
+  scale_y_continuous(labels = percent) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    legend.position = "bottom"
+  ) +
+  labs(
+    title = "Gender Composition by Passenger Class",
+    subtitle = "Demographic Imbalance as Potential Confounder",
+    x = "Passenger Class",
+    y = "Proportion",
+    caption = "Data: Titanic Training Set (n=891)"
+  )
+```
+
+Gender composition varies markedly across classes. If 1st class had proportionally more women, naive class comparisons confound class effects with the well-known "women and children first" policy. Stratifying by gender is essential to isolate the class effect.
+
+---
+
+## 4. Mechanism 1: Priority Rules & Demographic Factors
+
+### 4.1 Gender-Stratified Survival Analysis
+
+```{r survival_by_gender_class}
+# Survival by class, stratified by gender
+survival_gender_class <- titanic %>%
+  group_by(Class, Sex) %>%
+  summarise(
+    N = n(),
+    Survived = sum(Survived == "Yes"),
+    Survival_Rate = round(100 * Survived / N, 2),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(names_from = Sex, 
+              values_from = c(N, Survived, Survival_Rate),
+              names_glue = "{Sex}_{.value}")
+
+knitr::kable(survival_gender_class,
+             caption = "Survival Rates Stratified by Class and Gender - Testing Priority Effects")
+```
+
+This stratification is crucial. If "women and children first" is the dominant mechanism, we expect near-universal female survival (small variation across classes) with large class-based variation among males. Conversely, if access constraints are primary, we expect significant class-based variation within each gender group.
+
+### 4.2 Visualizing Gender-Class Interaction
+
+```{r plot_gender_class_interaction}
+# Calculate survival rates for visualization
+survival_detail <- titanic %>%
+  group_by(Class, Sex) %>%
+  summarise(
+    Survival_Rate = 100 * sum(Survived == "Yes") / n(),
+    N = n(),
+    .groups = "drop"
+  )
+
+ggplot(survival_detail, aes(x = Class, y = Survival_Rate, color = Sex, group = Sex)) +
+  geom_line(size = 1) +
+  geom_point(size = 3) +
+  scale_color_brewer(palette = "Set1") +
+  scale_y_continuous(limits = c(0, 100), labels = function(x) paste0(x, "%")) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    legend.position = "bottom"
+  ) +
+  labs(
+    title = "Survival Rates by Class and Gender",
+    subtitle = "Testing for Priority Rules vs. Access Constraints",
+    x = "Passenger Class",
+    y = "Survival Rate",
+    caption = "Data: Titanic Training Set"
+  )
+```
+
+This plot reveals whether the class effect is uniform across genders. If the lines are parallel (or females show near-ceiling effects), priority rules dominate. If lines diverge substantially, class-based access constraints operate within both gender groups.
+
+### 4.3 Age as a Vulnerability Proxy
+
+```{r survival_by_age_class}
+# Examine interaction between age groups and class
+survival_age_class <- titanic %>%
+  filter(Age_Group != "Missing") %>%
+  group_by(Class, Age_Group) %>%
+  summarise(
+    N = n(),
+    Survived = sum(Survived == "Yes"),
+    Survival_Rate = round(100 * Survived / N, 2),
+    .groups = "drop"
+  )
+
+knitr::kable(survival_age_class,
+             caption = "Survival Rates by Class and Age Group - Children vs. Adults")
+```
+
+Age differences create another confound. If "women and children first" was enforced, children in all classes should show high survival. If access constraints dominated, we'd expect lower survival for children in 3rd class due to geographic distance from lifeboats. This table tests these competing hypotheses.
+
+### 4.4 Visualizing Age-Class Patterns
+
+```{r plot_age_class_heatmap}
+# Create a summary for heatmap visualization
+age_class_matrix <- titanic %>%
+  filter(Age_Group != "Missing") %>%
+  group_by(Class, Age_Group) %>%
+  summarise(
+    Survival_Rate = 100 * sum(Survived == "Yes") / n(),
+    .groups = "drop"
+  )
+
+ggplot(age_class_matrix, aes(x = Age_Group, y = Class, fill = Survival_Rate)) +
+  geom_tile(color = "white", size = 1) +
+  geom_text(aes(label = paste0(round(Survival_Rate, 0), "%")), 
+            color = "black", size = 4) +
+  scale_fill_gradient(low = "#fee5d9", high = "#a1d99b", 
+                      name = "Survival Rate (%)") +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = "bottom",
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  ) +
+  labs(
+    title = "Survival Rates: Class × Age Interaction",
+    subtitle = "Testing Age-based Priority vs. Class-based Access Constraints",
+    x = "Age Group",
+    y = "Passenger Class",
+    caption = "Data: Titanic Training Set (excluding missing ages)"
+  )
+```
+
+This heatmap reveals interaction patterns. High survival across all age groups in 1st class but only for children in 3rd class would suggest prioritization. Conversely, high-order interactions suggest more complex access or coordination mechanisms at work.
+
+---
+
+## 5. Mechanism 2: Physical Access & Constraints
+
+### 5.1 Cabin Information as Location Proxy
+
+```{r cabin_info_analysis}
+# Examine whether cabin information (proxy for documented location) 
+# correlates with class and survival
+cabin_by_class <- titanic %>%
+  group_by(Class) %>%
+  summarise(
+    N = n(),
+    Has_Cabin = sum(Has_Cabin_Info),
+    Cabin_Info_Pct = round(100 * Has_Cabin / N, 1),
+    .groups = "drop"
+  )
+
+knitr::kable(cabin_by_class,
+             caption = "Availability of Cabin Information by Class - Access to Lifeboat Decks")
+```
+
+Cabin information availability indicates explicit passenger documentation, potentially reflecting boarding location and distance from lifeboats. If access constraints were binding, we expect:
+- Higher cabin documentation in 1st class (better record-keeping)
+- Those with cabin info should have higher survival (documented location facilitated evacuation)
+- This relationship should vary by class if constraint mechanisms differ
+
+### 5.2 Cabin Information and Survival
+
+```{r cabin_survival_analysis}
+cabin_survival <- titanic %>%
+  group_by(Class, Has_Cabin_Info) %>%
+  summarise(
+    N = n(),
+    Survived = sum(Survived == "Yes"),
+    Survival_Rate = round(100 * Survived / N, 2),
+    .groups = "drop"
+  ) %>%
+  mutate(Cabin_Status = ifelse(Has_Cabin_Info, "Cabin Info Available", 
+                               "Cabin Info Missing"))
+
+knitr::kable(cabin_survival,
+             caption = "Survival by Class and Cabin Documentation Status")
+```
+
+This analysis tests whether documented cabin location (as a proxy for passenger tracking and proximity to lifeboats) improved survival chances, and whether this effect differs by class. A strong cabin-survival relationship would support access constraint mechanisms.
+
+### 5.3 Family Size and Evacuation Logistics
+
+```{r family_size_analysis}
+# Examine family size as coordination/constraint mechanism
+family_survival <- titanic %>%
+  group_by(Class) %>%
+  summarise(
+    Mean_Family_Size = round(mean(Family_Size), 2),
+    Median_Family_Size = round(median(Family_Size), 2),
+    Alone_Pct = round(100 * sum(Traveling_Alone) / n(), 1),
+    .groups = "drop"
+  )
+
+knitr::kable(family_survival,
+             caption = "Family Structure by Class - Potential Evacuation Coordination Barriers")
+```
+
+Larger families face coordination challenges during evacuation. If family members had to stay together (a constraint), large families in 3rd class might face worse outcomes. This tests whether evacuation logistics created class-specific constraints beyond physical geography.
+
+### 5.4 Family Size Effect on Survival
+
+```{r family_size_survival}
+# Detailed analysis: family size interaction with class
+family_class_survival <- titanic %>%
+  mutate(Family_Category = case_when(
+    Family_Size == 1 ~ "Alone",
+    Family_Size == 2 ~ "2 people",
+    Family_Size == 3 ~ "3 people",
+    Family_Size >= 4 ~ "4+ people"
+  )) %>%
+  group_by(Class, Family_Category) %>%
+  summarise(
+    N = n(),
+    Survived = sum(Survived == "Yes"),
+    Survival_Rate = round(100 * Survived / N, 2),
+    .groups = "drop"
+  )
+
+knitr::kable(family_class_survival,
+             caption = "Survival by Family Size and Class - Testing Evacuation Logistics Constraints")
+```
+
+This stratification reveals whether large families experienced differential survival across classes. Strong class effects within family size categories would indicate structural access barriers. Conversely, similar family-size patterns across classes would suggest this mechanism affects all classes equally.
+
+### 5.5 Visualizing Family Size Effects
+
+```{r plot_family_survival}
+ggplot(family_class_survival, aes(x = Family_Category, y = Survival_Rate, 
+                                   fill = Class)) +
+  geom_col(position = "dodge", alpha = 0.8) +
+  scale_fill_brewer(palette = "Set2") +
+  scale_y_continuous(limits = c(0, 100), labels = function(x) paste0(x, "%")) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    legend.position = "bottom"
+  ) +
+  labs(
+    title = "Survival Rates by Family Size and Class",
+    subtitle = "Testing Evacuation Coordination as Access Constraint",
+    x = "Family Size Grouping",
+    y = "Survival Rate",
+    caption = "Data: Titanic Training Set"
+  )
+```
+
+This visualization shows whether family coordination created differential bottlenecks across classes, suggesting that evacuation logistics (not just physical distance) constrained 3rd class survival.
+
+---
+
+## 6. Mechanism 3: Conditional Independence Tests
+
+### 6.1 Controlling for Gender: Class Effect Among Males
+
+```{r male_survival_analysis}
+# Among males (controlling for priority rules), does class still matter?
+male_survival <- titanic %>%
+  filter(Sex == "male") %>%
+  group_by(Class) %>%
+  summarise(
+    N = n(),
+    Survived = sum(Survived == "Yes"),
+    Survival_Rate = round(100 * Survived / N, 2),
+    .groups = "drop"
+  )
+
+knitr::kable(male_survival,
+             caption = "Survival Among Male Passengers Only - Isolating Class Effect")
+```
+
+By examining only males, we largely control for the "women and children first" policy effect. If substantial class variation remains among males, this suggests mechanisms beyond explicit priority rules—likely access constraints or unequal access to information about evacuation procedures.
+
+### 6.2 Class Advantage Among Males: Quantifying Constraint Effects
+
+```{r male_class_gap}
+male_survival_stats <- titanic %>%
+  filter(Sex == "male") %>%
+  group_by(Class) %>%
+  summarise(Survival_Rate = 100 * sum(Survived == "Yes") / n())
+
+gap_1st_3rd_male <- male_survival_stats$Survival_Rate[1] - male_survival_stats$Survival_Rate[3]
+
+cat(sprintf("Among males: 1st class advantage = %.1f percentage points\n", gap_1st_3rd_male))
+```
+
+This quantifies the class gap after controlling for gender. A substantial gap suggests access constraints or information advantages were consequential. This number will be referenced throughout our interpretation.
+
+### 6.3 Comparing Male vs. Female Class Gaps
+
+```{r gender_comparison_gap}
+# Calculate class gaps separately by gender
+gap_analysis <- titanic %>%
+  group_by(Sex) %>%
+  summarise(
+    Class_1_Survival = 100 * sum(Survived == "Yes" & Class == "1st Class") / 
+                             sum(Class == "1st Class"),
+    Class_3_Survival = 100 * sum(Survived == "Yes" & Class == "3rd Class") / 
+                             sum(Class == "3rd Class"),
+    Class_Gap = Class_1_Survival - Class_3_Survival,
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), ~round(., 2)))
+
+knitr::kable(gap_analysis,
+             caption = "Class Survival Gap by Gender - Decomposing Priority vs. Constraints")
+```
+
+If females show a much smaller class gap (because priority rules ensured high survival regardless of class), while males show a large gap, this is strong evidence that access constraints—not just rules—drive the overall class effect. We then can quantify what proportion of the raw class gap is "left over" after accounting for gender.
+
+### 6.4 Decomposition: Gap Attribution
+
+```{r gap_decomposition}
+# Overall gap
+overall_gap <- titanic %>%
+  group_by(Class) %>%
+  summarise(Rate = 100 * sum(Survived == "Yes") / n()) %>%
+  pull(Rate)
+
+overall_class_gap <- overall_gap[1] - overall_gap[3]
+
+# Gap among females
+female_gap <- titanic %>%
+  filter(Sex == "female") %>%
+  group_by(Class) %>%
+  summarise(Rate = 100 * sum(Survived == "Yes") / n()) %>%
+  pull(Rate)
+
+female_class_gap <- female_gap[1] - female_gap[3]
+
+# Gap among males (calculated earlier)
+male_class_gap <- gap_1st_3rd_male
+
+# Composition effect: contribution of gender imbalance
+composition_contrib <- overall_class_gap - male_class_gap
+
+decomposition_table <- tibble(
+  Mechanism = c("Raw Class Gap (1st - 3rd)", 
+                "Residual Class Gap Among Males",
+                "Female Class Gap",
+                "Estimated Composition Effect"),
+  Value = c(overall_class_gap, male_class_gap, female_class_gap, 
+            overall_class_gap - male_class_gap),
+  Interpretation = c("Total observed disparity",
+                    "Gap after gender standardization",
+                    "Class variation despite priority rules",
+                    "Contribution of gender imbalance across classes")
+)
+
+knitr::kable(decomposition_table,
+             caption = "Decomposition: Raw Gap vs. Constrained Variation")
+```
+
+This decomposition quantifies how much of the observed class gap is attributable to demographic imbalance (priority rules favoring groups overrepresented in 1st class) versus structural constraints (access barriers affecting all groups). If the male class gap is close to the overall gap, constraints are primary; if it's much smaller, gender composition plays a large role.
+
+---
+
+## 7. Summary: Interpreting the Mechanisms
+
+### 7.1 Key Findings to Interpret
+
+```{r summary_statistics}
+# Compile summary statistics for interpretation
+summary_df <- tibble(
+  Metric = c(
+    "1st Class Survival Rate",
+    "3rd Class Survival Rate",
+    "Raw Class Gap",
+    "Class Gap (Males Only)",
+    "Class Gap (Females Only)",
+    "Female Survival Rate (1st Class)",
+    "Female Survival Rate (3rd Class)",
+    "Male Survival Rate (1st Class)",
+    "Male Survival Rate (3rd Class)"
+  ),
+  Value = c(
+    round(100 * sum(titanic$Survived == "Yes" & titanic$Class == "1st Class") / 
+                  sum(titanic$Class == "1st Class"), 1),
+    round(100 * sum(titanic$Survived == "Yes" & titanic$Class == "3rd Class") / 
+                  sum(titanic$Class == "3rd Class"), 1),
+    overall_class_gap,
+    male_class_gap,
+    female_class_gap,
+    round(100 * sum(titanic$Survived == "Yes" & titanic$Class == "1st Class" & titanic$Sex == "female") / 
+                  sum(titanic$Class == "1st Class" & titanic$Sex == "female"), 1),
+    round(100 * sum(titanic$Survived == "Yes" & titanic$Class == "3rd Class" & titanic$Sex == "female") / 
+                  sum(titanic$Class == "3rd Class" & titanic$Sex == "female"), 1),
+    round(100 * sum(titanic$Survived == "Yes" & titanic$Class == "1st Class" & titanic$Sex == "male") / 
+                  sum(titanic$Class == "1st Class" & titanic$Sex == "male"), 1),
+    round(100 * sum(titanic$Survived == "Yes" & titanic$Class == "3rd Class" & titanic$Sex == "male") / 
+                  sum(titanic$Class == "3rd Class" & titanic$Sex == "male"), 1)
+  )
+)
+
+knitr::kable(summary_df,
+             caption = "Summary Statistics for Mechanism Interpretation")
+```
+
+These numbers form the empirical foundation for assessing which mechanisms explain the class-survival gap.
+
+### 7.2 Interpretation Framework
+
+The analysis presented above provides several key pieces of evidence for interpreting mechanism:
+
+**Priority Rules Interpretation**: If females in both 1st and 3rd class show similarly high survival (small female class gap), while males show large variation across classes, this suggests "women first" was enforced regardless of class. The female class gap of `r female_class_gap` percentage points compared to the male gap of `r male_class_gap` points toward the relative importance of these mechanisms.
+
+**Access Constraints Interpretation**: If a substantial class gap persists even among males (and within narrow age groups, or controlling for other factors), this indicates structural barriers—lifeboat access, deck location, or gate barriers—created differential evacuation chances. The `r male_class_gap` percentage point gap among males alone indicates the magnitude of these constraint mechanisms.
+
+**Demographic Composition Interpretation**: The difference between the overall class gap (`r overall_class_gap` points) and the male-only gap (`r male_class_gap` points) equals approximately `r round(overall_class_gap - male_class_gap, 1)` points, representing the contribution of differential gender composition across classes. This is an upper bound on the "priority rule" effect operating through demographic imbalance.
+
+### 7.3 Methodological Limitations and Next Steps
+
+The stratified analyses above isolate class effects under the assumption that gender, age, and family structure are exogenous (not influenced by class). While these assumptions are reasonable given the assignment to class was based on pre-existing social status, future analyses could:
+
+1. Employ propensity score matching to create more comparable subgroups across classes
+2. Use multivariate regression to simultaneously control for multiple confounders
+3. Examine heterogeneous treatment effects using machine learning methods
+4. Analyze embarkation port patterns to test geographic constraint hypotheses
+5. Study temporal patterns in evacuation to test whether certain groups had earlier access to lifeboats
+
+The current analysis provides the descriptive foundation necessary for these more sophisticated causal interpretations.
+
+---
+
+## Conclusion
+
+This report has outlined a systematic approach to decomposing the class-survival gap into mechanisms: priority rules (reflected in differential survival by gender and age), access constraints (reflected in persistent class gaps within demographic groups), and demographic composition (the mix of men, women, and children in each class).
+
+The empirical patterns in the data—particularly the male class gap of `r male_class_gap` points and female class gap of `r female_class_gap` points—provide evidence for distinguishing between these mechanisms. Readers can now examine the evidence systematically and draw their own conclusions about which mechanisms drove the disparity, guided by the quantitative facts presented throughout this analysis.
+
