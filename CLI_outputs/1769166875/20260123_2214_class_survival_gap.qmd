@@ -1,0 +1,97 @@
+---
+title: "Class–Survival Gap: Access vs Priority"
+author: "CLI Copilot"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    self-contained: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Introduction
+
+This report outlines a detailed, step-by-step plan to analyze how much of the class–survival gap in the Titanic dataset is explained by access and constraints rather than priority rules. Each section and code chunk is accompanied by thorough explanations of the rationale, assumptions, and how each step contributes to answering the research question. All reported numbers will be referenced directly from code output.
+
+# Data Overview
+
+```{r}
+library(tidyverse)
+train <- read_csv("../../data/train.csv")
+glimpse(train)
+```
+
+# Section Plan
+
+1. **Descriptive Statistics:**
+   - Summarize survival rates by class, sex, age, and embarkation point.
+   - Explain how these summaries provide a baseline for understanding the class–survival gap.
+2. **Access and Constraints Analysis:**
+   - Examine variables that may represent access (e.g., cabin location, fare, embarkation point).
+   - Discuss how these features may constrain or enable survival, independent of priority rules.
+3. **Priority Rules Analysis:**
+   - Analyze the effect of explicit priority rules (e.g., women and children first) on survival within each class.
+   - Compare survival rates for women/children vs. men within each class.
+4. **Multivariate Modeling:**
+   - Propose logistic regression or similar models to estimate the contribution of access/constraints vs. priority rules.
+   - Explain the logic of model selection and interpretation.
+
+# Detailed Steps and Explanations
+
+## 1. Descriptive Statistics
+
+```{r}
+# Calculate survival rates by class
+survival_by_class <- train %>%
+  group_by(Pclass) %>%
+  summarize(survival_rate = mean(Survived, na.rm = TRUE), n = n())
+survival_by_class
+```
+
+*Explanation: This code chunk computes the survival rate for each passenger class. It provides a direct measure of the class–survival gap, which is the starting point for our analysis. The number of observations per class is also reported to contextualize the rates.*
+
+## 2. Access and Constraints Analysis
+
+```{r}
+# Explore fare and embarkation as proxies for access
+access_summary <- train %>%
+  group_by(Pclass, Embarked) %>%
+  summarize(mean_fare = mean(Fare, na.rm = TRUE),
+            survival_rate = mean(Survived, na.rm = TRUE),
+            n = n())
+access_summary
+```
+
+*Explanation: This chunk examines how fare and embarkation point, as proxies for access, relate to survival within each class. By comparing these summaries, we can assess whether differences in access explain part of the class–survival gap.*
+
+## 3. Priority Rules Analysis
+
+```{r}
+# Analyze survival by sex and age within class
+priority_summary <- train %>%
+  mutate(child = if_else(Age < 15, "Child", "Adult", missing = "Unknown")) %>%
+  group_by(Pclass, Sex, child) %>%
+  summarize(survival_rate = mean(Survived, na.rm = TRUE), n = n())
+priority_summary
+```
+
+*Explanation: This code chunk investigates the impact of priority rules (women and children first) by comparing survival rates for women, men, and children within each class. This helps isolate the effect of priority rules from access constraints.*
+
+## 4. Multivariate Modeling
+
+```{r}
+# Propose a logistic regression model
+model <- glm(Survived ~ Pclass + Sex + Age + Fare + Embarked, data = train, family = binomial)
+summary(model)
+```
+
+*Explanation: This chunk proposes a logistic regression model to estimate the independent effects of class, sex, age, fare, and embarkation on survival. The model helps quantify how much of the class–survival gap is explained by access/constraints (e.g., fare, embarkation) versus priority rules (sex, age).*
+
+# Next Steps
+
+- Render this report to HTML and review outputs for clarity and completeness.
+- Refine analysis and explanations as needed based on results.
