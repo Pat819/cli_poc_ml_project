@@ -1,0 +1,57 @@
+---
+title: "Class–Survival Gap Analysis: Access vs Priority Rules"
+author: "CLI Copilot"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    self-contained: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Introduction
+
+This report addresses the research question: **How much of the class–survival gap is explained by access and constraints rather than priority rules?**
+
+## Analysis Plan
+
+We will:
+1. Explore the Titanic dataset and relevant variables (class, survival, access, constraints, priority rules).
+2. Propose a stepwise analysis to decompose the class–survival gap.
+3. For each code chunk, provide detailed explanation of the logic, assumptions, and relevance to the research question.
+
+# Data Overview
+
+```{r}
+library(tidyverse)
+library(knitr)
+train <- read_csv("../../data/train.csv")
+test <- read_csv("../../data/test.csv")
+summary(train)
+```
+
+# Class–Survival Gap
+
+```{r}
+class_survival <- train %>%
+  group_by(Pclass) %>%
+  summarize(survival_rate = mean(Survived), n = n())
+knitr::kable(class_survival)
+```
+
+# Decomposing the Gap: Access & Constraints vs Priority Rules
+
+```{r}
+# Placeholder for further decomposition analysis
+# e.g., stratify by sex, age, embarkation, etc.
+```
+
+# Next Steps
+
+- Refine decomposition logic
+- Visualize findings
+- Document all steps and reasoning
