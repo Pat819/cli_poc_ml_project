@@ -1,0 +1,468 @@
+---
+title: "Class-Survival Gap Analysis: Access vs. Policy on the Titanic"
+author: "CLI Copilot"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    self-contained: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Introduction
+
+## Research Question
+
+To what extent is the survival advantage of 1st class passengers mediated by *location/access* (deck/cabin proximity, cabin availability, fare level) versus *policy* ("women and children first")? This analysis proposes a methodological framework to quantify these mechanisms using mediation analysis concepts.
+
+## Why This Matters
+
+The Titanic dataset presents a unique natural experiment. Class survival disparities could stem from two distinct mechanisms: (1) **structural access** — first-class passengers had better access to lifeboats due to their cabin locations and the ship's design, and (2) **social policy** — the "women and children first" evacuation protocol may have been applied differentially across classes. By decomposing the class effect into direct effects (policy) and indirect effects (access), we can understand whether class mattered because of *where* people were located or *who* was prioritized.
+
+## Data Overview
+
+The analysis uses the Titanic passenger dataset with `r nrow(readr::read_csv('../../data/train.csv', show_col_types = FALSE))` passengers in the training set. Variables include passenger class (Pclass), demographics (Sex, Age), family relationships (SibSp, Parch), cabin information (Cabin), fare paid (Fare), embarkation port (Embarked), and survival outcome (Survived).
+
+---
+
+# Data Preparation and Exploration
+
+## Loading and Inspecting the Data
+
+```{r}
+library(tidyverse)
+library(knitr)
+
+# Load data
+titanic_raw <- read_csv('../../data/train.csv', show_col_types = FALSE)
+
+# Display structure
+tibble::glimpse(titanic_raw)
+```
+
+This code chunk loads the training dataset and displays its structure. We use `tidyverse` for data manipulation and ggplot2 for visualization. The glimpse function provides column names, data types, and sample values, allowing us to understand the dataset's composition before analysis.
+
+```{r}
+# Check dimensions and missing values
+cat("Dataset dimensions:", nrow(titanic_raw), "rows x", ncol(titanic_raw), "columns\n\n")
+
+missing_summary <- titanic_raw %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Missing_Count") %>%
+  mutate(Missing_Percent = round(100 * Missing_Count / nrow(titanic_raw), 1)) %>%
+  arrange(desc(Missing_Count))
+
+kable(missing_summary, caption = "Missing Values Summary")
+```
+
+This chunk calculates missing value patterns across all variables. Understanding missingness is critical because (1) cabin data will be our key proxy for access/location, and (2) age missingness may bias survival estimates if not handled carefully. The table shows that Cabin has the most missing values (~77%), followed by Age (~20%), which will influence our proxy creation strategy.
+
+## Creating Access and Demographic Proxies
+
+```{r}
+titanic <- titanic_raw %>%
+  # Create cabin letter (deck proxy)
+  mutate(
+    cabin_letter = str_extract(Cabin, "^[A-Z]"),
+    cabin_missing = is.na(Cabin),
+    deck_known = !cabin_missing
+  ) %>%
+  # Create family size proxy for access constraints
+  mutate(
+    family_size = SibSp + Parch + 1,  # +1 for self
+    family_group = case_when(
+      family_size == 1 ~ "Alone",
+      family_size == 2 ~ "Pair",
+      family_size >= 3 ~ "Group3+"
+    )
+  ) %>%
+  # Clean embarked (remove blanks)
+  filter(Embarked != "" | is.na(Embarked)) %>%
+  # Create class labels for clarity
+  mutate(
+    pclass_label = case_when(
+      Pclass == 1 ~ "1st Class",
+      Pclass == 2 ~ "2nd Class",
+      Pclass == 3 ~ "3rd Class"
+    ),
+    sex_label = case_when(
+      Sex == "male" ~ "Male",
+      Sex == "female" ~ "Female"
+    ),
+    survived_label = case_when(
+      Survived == 1 ~ "Survived",
+      Survived == 0 ~ "Did Not Survive"
+    )
+  ) %>%
+  # Convert to factors for analysis
+  mutate(across(c(pclass_label, sex_label, survived_label, family_group), as.factor))
+
+# Display processed data
+cat("Processed dataset dimensions:", nrow(titanic), "rows x", ncol(titanic), "columns\n")
+kable(head(titanic[, c("Pclass", "Sex", "Age", "Fare", "Cabin", "cabin_letter", "cabin_missing", "family_size", "Survived")], 10),
+      caption = "Sample of Processed Data with Proxies")
+```
+
+This code chunk creates three key proxies for **access/constraints** that may mediate class effects: (1) **Cabin letter** — extracted from Cabin data to indicate deck location (A=upper, E=lower), as cabin location determines evacuation priority and proximity to lifeboats; (2) **Cabin missingness** — a binary indicator that approximately 77% of passengers lack cabin data, possibly indicating crew members or uncertain bookings, which itself may affect survival; (3) **Family size** — passengers in larger family groups face coordination challenges and may have different evacuation experiences. These proxies operationalize the "access and constraints" mechanism distinct from the "women and children first" policy.
+
+## Overall Descriptive Statistics
+
+```{r}
+# Summary statistics for key variables
+summary_stats <- titanic %>%
+  summarise(
+    n = n(),
+    n_survived = sum(Survived, na.rm = TRUE),
+    overall_survival_rate = mean(Survived, na.rm = TRUE),
+    mean_age = mean(Age, na.rm = TRUE),
+    mean_fare = mean(Fare, na.rm = TRUE),
+    pct_female = 100 * mean(Sex == "female", na.rm = TRUE),
+    pct_cabin_known = 100 * mean(!cabin_missing, na.rm = TRUE),
+    pct_alone = 100 * mean(family_group == "Alone", na.rm = TRUE)
+  )
+
+kable(t(summary_stats), caption = "Overall Sample Statistics")
+```
+
+This chunk provides baseline descriptive statistics for the full sample. The overall survival rate is `r round(100 * with(titanic, mean(Survived, na.rm = TRUE)), 1)`%, with `r round(100 * with(titanic, mean(Sex == "female", na.rm = TRUE)), 1)`% female passengers. Only `r round(100 * with(titanic, mean(!cabin_missing, na.rm = TRUE)), 1)`% have recorded cabin information, and `r round(100 * with(titanic, mean(family_group == "Alone", na.rm = TRUE)), 1)`% traveled alone. These baseline figures ground subsequent comparisons.
+
+---
+
+# Descriptive Analysis: Class Effects and Potential Mediators
+
+## Class and Overall Survival
+
+```{r}
+# Survival rate by class (the main effect to decompose)
+class_survival <- titanic %>%
+  group_by(pclass_label) %>%
+  summarise(
+    n = n(),
+    n_survived = sum(Survived),
+    survival_rate = mean(Survived),
+    mean_age = mean(Age, na.rm = TRUE),
+    mean_fare = mean(Fare, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  mutate(survival_pct = round(100 * survival_rate, 1))
+
+kable(class_survival, 
+      caption = "Survival Rate by Passenger Class")
+```
+
+This chunk calculates the primary outcome of interest: survival rates by class. The class effect is the gap we want to understand mechanistically. First class passengers had a survival rate of `r round(100 * filter(class_survival, pclass_label == "1st Class")$survival_rate, 1)`%, compared to `r round(100 * filter(class_survival, pclass_label == "2nd Class")$survival_rate, 1)`% for second class and `r round(100 * filter(class_survival, pclass_label == "3rd Class")$survival_rate, 1)`% for third class. This creates a clear gradient we investigate further.
+
+## The Policy Mechanism: "Women and Children First"
+
+```{r}
+# Survival by class and sex (policy proxy)
+policy_analysis <- titanic %>%
+  group_by(pclass_label, sex_label) %>%
+  summarise(
+    n = n(),
+    n_survived = sum(Survived),
+    survival_rate = mean(Survived),
+    .groups = 'drop'
+  ) %>%
+  mutate(survival_pct = round(100 * survival_rate, 1))
+
+kable(policy_analysis, 
+      caption = "Survival Rate by Class and Sex (Policy Mechanism)")
+```
+
+This chunk examines whether the "women and children first" policy was applied uniformly across classes or differentially. If policy is the sole mechanism, we expect survival rates for women to be similarly high (approaching 100%) in all classes, and men's rates to vary more by class. Sex serves as a proxy for the policy mechanism because evacuation protocols prioritized women.
+
+## Access Mechanisms: Cabin and Fare Proxies
+
+```{r}
+# Cabin availability by class
+cabin_by_class <- titanic %>%
+  group_by(pclass_label) %>%
+  summarise(
+    n = n(),
+    n_cabin_known = sum(!cabin_missing),
+    pct_cabin_known = round(100 * mean(!cabin_missing), 1),
+    .groups = 'drop'
+  )
+
+kable(cabin_by_class, 
+      caption = "Cabin Information Availability by Class (Access Proxy)")
+```
+
+This chunk shows that `r filter(cabin_by_class, pclass_label == "1st Class")$pct_cabin_known`% of first class passengers have known cabin information, compared to `r filter(cabin_by_class, pclass_label == "2nd Class")$pct_cabin_known`% of second class and `r filter(cabin_by_class, pclass_label == "3rd Class")$pct_cabin_known`% of third class. This disparity itself indicates differential access/documentation — first class passengers were better recorded and arguably had better-known locations on the ship, providing a structural advantage in evacuation.
+
+```{r}
+# Fare distribution by class (economic access proxy)
+fare_by_class <- titanic %>%
+  filter(!is.na(Fare)) %>%
+  group_by(pclass_label) %>%
+  summarise(
+    n = n(),
+    mean_fare = round(mean(Fare), 2),
+    median_fare = round(median(Fare), 2),
+    min_fare = round(min(Fare), 2),
+    max_fare = round(max(Fare), 2),
+    .groups = 'drop'
+  )
+
+kable(fare_by_class, 
+      caption = "Fare Distribution by Class (Economic Access Proxy)")
+```
+
+Fare paid is a proxy for economic resources and possibly the quality of accommodations and proximity to lifeboats. First class passengers paid a mean of £`r round(filter(fare_by_class, pclass_label == "1st Class")$mean_fare, 0)`, versus £`r round(filter(fare_by_class, pclass_label == "2nd Class")$mean_fare, 0)` for second class and £`r round(filter(fare_by_class, pclass_label == "3rd Class")$mean_fare, 0)` for third class. Higher fares likely corresponded to better cabins and deck locations.
+
+```{r}
+# Family size distribution by class
+family_by_class <- titanic %>%
+  group_by(pclass_label, family_group) %>%
+  summarise(
+    n = n(),
+    survival_rate = mean(Survived),
+    .groups = 'drop'
+  ) %>%
+  mutate(survival_pct = round(100 * survival_rate, 1)) %>%
+  pivot_wider(names_from = family_group, values_from = c(n, survival_pct), names_sep = "_")
+
+kable(family_by_class, 
+      caption = "Family Group Size Distribution and Survival by Class")
+```
+
+Family size may constrain access during evacuation — families with young children or multiple members might have experienced delays or coordination difficulties. This chunk shows survival rates stratified by class and family group size. For example, first class passengers traveling alone had a survival rate of `r round(100 * with(filter(titanic, pclass_label == "1st Class", family_group == "Alone"), mean(Survived)), 1)`%, suggesting family size is a relevant constraint factor.
+
+---
+
+# Mediation Analysis Framework: Decomposing the Class Effect
+
+## Model 1: Class Effect Only (Unadjusted)
+
+```{r}
+# Simple logistic regression: class only
+model_unadjusted <- glm(Survived ~ as.numeric(Pclass), 
+                         data = titanic, 
+                         family = binomial(link = "logit"))
+
+# Extract coefficients (standardize Pclass so 1st=1, 2nd=2, 3rd=3)
+unadj_coef <- coef(model_unadjusted)
+unadj_pclass_coef <- unadj_coef["as.numeric(Pclass)"]
+unadj_pclass_or <- exp(unadj_pclass_coef)
+
+cat("Unadjusted Model: Survival ~ Class\n")
+cat("Class coefficient (log-odds): ", round(unadj_pclass_coef, 4), "\n")
+cat("Class coefficient (odds ratio): ", round(unadj_pclass_or, 4), "\n")
+cat("Interpretation: Each class level increase reduces odds of survival by", 
+    round(100 * (1 - unadj_pclass_or), 1), "%\n")
+```
+
+This model estimates the **direct/unadjusted class effect** on survival without considering access or policy mechanisms. The class coefficient of `r round(unadj_pclass_coef, 4)` (log-odds) translates to an odds ratio of `r round(unadj_pclass_or, 4)`, meaning moving from a lower to higher class number (better situation to worse) reduces survival odds by `r round(100 * (1 - unadj_pclass_or), 1)`%. This is our baseline effect to decompose.
+
+## Model 2: Class + Sex (Policy Mechanism)
+
+```{r}
+# Logistic regression including sex
+model_sex <- glm(Survived ~ as.numeric(Pclass) + Sex, 
+                 data = titanic, 
+                 family = binomial(link = "logit"))
+
+sex_coef <- coef(model_sex)
+sex_pclass_coef <- sex_coef["as.numeric(Pclass)"]
+sex_pclass_or <- exp(sex_pclass_coef)
+sex_male_coef <- sex_coef["Sexmale"]
+sex_male_or <- exp(sex_male_coef)
+
+cat("Model with Sex: Survival ~ Class + Sex\n")
+cat("Class coefficient (log-odds): ", round(sex_pclass_coef, 4), "\n")
+cat("Class coefficient (odds ratio): ", round(sex_pclass_or, 4), "\n")
+cat("Sex=Male coefficient (odds ratio): ", round(sex_male_or, 4), "\n")
+cat("\nReduction in class effect: ", 
+    round(100 * (unadj_pclass_coef - sex_pclass_coef) / unadj_pclass_coef, 1), "%\n")
+```
+
+Adding sex to the model tests whether the "women and children first" policy explains part of the class effect. If women had consistently high survival across all classes, then adjusting for sex should reduce the class coefficient. The class coefficient reduces by `r round(100 * (unadj_pclass_coef - sex_pclass_coef) / unadj_pclass_coef, 1)`% when sex is included, suggesting that approximately this proportion of the class advantage is mediated by sex-based policy rather than structural access.
+
+## Model 3: Class + Access Proxies (Structural Access Mechanisms)
+
+```{r}
+# Logistic regression with access proxies
+model_access <- glm(Survived ~ as.numeric(Pclass) + cabin_missing + Fare + Sex, 
+                    data = titanic %>% filter(!is.na(Fare)), 
+                    family = binomial(link = "logit"))
+
+access_coef <- coef(model_access)
+access_pclass_coef <- access_coef["as.numeric(Pclass)"]
+access_pclass_or <- exp(access_pclass_coef)
+access_fare_coef <- access_coef["Fare"]
+access_fare_or <- exp(access_fare_coef)
+access_cabin_coef <- access_coef["cabin_missingTRUE"]
+access_cabin_or <- exp(access_cabin_coef)
+
+cat("Model with Access Proxies: Survival ~ Class + Cabin_Missing + Fare + Sex\n")
+cat("Class coefficient (log-odds): ", round(access_pclass_coef, 4), "\n")
+cat("Class coefficient (odds ratio): ", round(access_pclass_or, 4), "\n")
+cat("Cabin_Missing=TRUE coefficient (odds ratio): ", round(access_cabin_or, 4), "\n")
+cat("Fare coefficient (log-odds per £): ", round(access_fare_coef, 4), "\n")
+cat("Fare coefficient (odds ratio per £): ", round(access_fare_or, 4), "\n")
+cat("\nReduction in class effect: ", 
+    round(100 * (unadj_pclass_coef - access_pclass_coef) / unadj_pclass_coef, 1), "%\n")
+```
+
+This model includes access-related proxies: cabin information (missing vs. known) and fare paid. The cabin variable captures whether passengers had documented cabin locations (first class advantage); fare captures economic resources and likely cabin quality. When these proxies are included alongside class and sex, the class coefficient reduces by `r round(100 * (unadj_pclass_coef - access_pclass_coef) / unadj_pclass_coef, 1)`%, indicating that structural access explains approximately this proportion of the class effect beyond sex-based policy.
+
+## Model Comparison Summary
+
+```{r}
+# Comparison table
+model_comparison <- tibble(
+  Model = c("Class Only (Unadjusted)", 
+            "Class + Sex (Policy)", 
+            "Class + Access Proxies"),
+  Class_Coef = c(round(unadj_pclass_coef, 4), 
+                 round(sex_pclass_coef, 4), 
+                 round(access_pclass_coef, 4)),
+  Class_OR = c(round(unadj_pclass_or, 4), 
+               round(sex_pclass_or, 4), 
+               round(access_pclass_or, 4)),
+  Pct_Reduction = c(0, 
+                    round(100 * (unadj_pclass_coef - sex_pclass_coef) / unadj_pclass_coef, 1),
+                    round(100 * (unadj_pclass_coef - access_pclass_coef) / unadj_pclass_coef, 1))
+)
+
+kable(model_comparison, 
+      caption = "Class Effect Decomposition: Policy vs. Access Mechanisms")
+```
+
+This summary table directly addresses the research question. Comparing the unadjusted class effect to models with policy and access proxies allows us to estimate: (1) what proportion of the class effect is mediated by sex-based policy ("women and children first"), and (2) what proportion is mediated by structural access differences (cabin documentation, fare/resources). The remaining unexplained effect suggests either unmeasured mechanisms or direct discrimination.
+
+---
+
+# Visualization
+
+## Survival Rate by Class and Sex
+
+```{r}
+# Create visualization of policy effect
+viz_policy <- titanic %>%
+  group_by(pclass_label, sex_label) %>%
+  summarise(
+    n = n(),
+    survival_rate = mean(Survived),
+    .groups = 'drop'
+  ) %>%
+  ggplot(aes(x = pclass_label, y = survival_rate, fill = sex_label)) +
+  geom_col(position = "dodge", alpha = 0.8, color = "black", linewidth = 0.3) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1)) +
+  scale_fill_manual(values = c("Female" = "#E69F00", "Male" = "#56B4E9")) +
+  labs(
+    title = "Survival Rate by Class and Sex: Policy Mechanism",
+    x = "Passenger Class",
+    y = "Survival Rate",
+    fill = "Sex",
+    caption = "The 'Women and Children First' policy shows as high female survival across all classes."
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold", size = 12),
+    panel.grid.major.x = element_blank()
+  )
+
+print(viz_policy)
+```
+
+This visualization directly shows the policy mechanism. Observe that female survival rates are consistently high across all classes (`r round(100 * filter(policy_analysis, sex_label == "Female", pclass_label == "1st Class")$survival_rate, 1)`% in 1st, `r round(100 * filter(policy_analysis, sex_label == "Female", pclass_label == "2nd Class")$survival_rate, 1)`% in 2nd, `r round(100 * filter(policy_analysis, sex_label == "Female", pclass_label == "3rd Class")$survival_rate, 1)`% in 3rd), supporting the "women and children first" protocol. Male survival, however, shows marked class gradients, suggesting that for men, class matters substantially.
+
+## Cabin Information by Class and Survival
+
+```{r}
+# Visualize access difference: cabin information
+cabin_data <- titanic %>%
+  group_by(pclass_label, cabin_missing, Survived) %>%
+  tally() %>%
+  group_by(pclass_label, cabin_missing) %>%
+  mutate(pct = 100 * n / sum(n)) %>%
+  filter(Survived == 1)
+
+viz_cabin <- cabin_data %>%
+  ggplot(aes(x = pclass_label, y = n, fill = cabin_missing)) +
+  geom_col(position = "dodge", alpha = 0.8, color = "black", linewidth = 0.3) +
+  scale_fill_manual(values = c("FALSE" = "#2CA02C", "TRUE" = "#D62728"),
+                    labels = c("FALSE" = "Cabin Known", "TRUE" = "Cabin Missing")) +
+  labs(
+    title = "Survivors by Class and Cabin Information (Access Proxy)",
+    x = "Passenger Class",
+    y = "Number of Survivors",
+    fill = "Cabin Status",
+    caption = "First class passengers with known cabins had better documentation and likely better access."
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold", size = 12),
+    panel.grid.major.x = element_blank()
+  )
+
+print(viz_cabin)
+```
+
+This visualization shows the access mechanism: first class passengers had documented cabin information at a much higher rate than third class. Among `r filter(cabin_by_class, pclass_label == "1st Class")$n` first class passengers, `r filter(cabin_by_class, pclass_label == "1st Class")$n_cabin_known` had known cabins, versus `r filter(cabin_by_class, pclass_label == "3rd Class")$n_cabin_known` of `r filter(cabin_by_class, pclass_label == "3rd Class")$n` third class passengers. Known cabin location likely facilitated evacuation by enabling crew to locate and direct passengers to lifeboats.
+
+## Fare Distribution by Class
+
+```{r}
+# Visualize economic access
+viz_fare <- titanic %>%
+  filter(!is.na(Fare)) %>%
+  ggplot(aes(x = pclass_label, y = Fare, fill = pclass_label)) +
+  geom_boxplot(alpha = 0.7, outlier.alpha = 0.5, color = "black", linewidth = 0.3) +
+  scale_y_log10() +
+  scale_fill_manual(values = c("1st Class" = "#1B9E77", "2nd Class" = "#D95F02", "3rd Class" = "#7570B3")) +
+  labs(
+    title = "Fare Distribution by Class (Economic Access Proxy)",
+    x = "Passenger Class",
+    y = "Fare (£, log scale)",
+    fill = "Class",
+    caption = "Higher fares (1st class) likely indicate better cabins and deck locations, closer to lifeboats."
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold", size = 12),
+    panel.grid.major.x = element_blank()
+  )
+
+print(viz_fare)
+```
+
+Fare paid is a strong proxy for economic resources and accommodation quality. The median fare for first class (£`r round(filter(fare_by_class, pclass_label == "1st Class")$median_fare, 0)`) is substantially higher than second (£`r round(filter(fare_by_class, pclass_label == "2nd Class")$median_fare, 0)`) and third class (£`r round(filter(fare_by_class, pclass_label == "3rd Class")$median_fare, 0)`). Higher fares presumptively purchased cabins in more accessible locations on the ship.
+
+---
+
+# Summary and Methodological Implications
+
+## Key Findings for Decomposition
+
+This analysis proposes a framework to address the research question: "How much of the class–survival gap is explained by access/constraints rather than policy?"
+
+The **unadjusted class effect** (Model 1) establishes the baseline gap: each class level reduces survival odds by `r round(100 * (1 - unadj_pclass_or), 1)`%.
+
+Adding **sex as a policy proxy** (Model 2) reduces the class effect by `r round(100 * (unadj_pclass_coef - sex_pclass_coef) / unadj_pclass_coef, 1)`%, suggesting this percentage of the class advantage was mediated by the "women and children first" protocol being applied across all classes.
+
+Adding **access proxies** like cabin information and fare (Model 3) reduces the class effect by `r round(100 * (unadj_pclass_coef - access_pclass_coef) / unadj_pclass_coef, 1)`%, suggesting this percentage reflects structural differences in cabin location and documented access.
+
+## Limitations and Next Steps
+
+1. **Cabin data sparsity**: With ~77% missing cabin information overall, our cabin-based proxies are limited. Future research could use historical ship diagrams to infer cabin locations from ticket numbers.
+
+2. **Unmeasured mechanisms**: The unexplained portion of the class effect may reflect crew behavior, additional policy implementations, or factors not captured in available data.
+
+3. **Causal interpretation**: These models are descriptive decompositions, not true causal mediation analyses. Proper causal inference would require additional assumptions or methods (e.g., natural experiments, instrumental variables).
+
+4. **Family dynamics**: Family size shows complex relationships with survival; future analysis could model family-level evacuation patterns using ticket groupings.
+
+## Conclusion
+
+This report demonstrates a methodological approach to decomposing class effects into policy and access components using mediation logic. The analyses suggest that approximately `r round(100 * (unadj_pclass_coef - sex_pclass_coef) / unadj_pclass_coef, 1)`% of the class effect is mediated by sex-based policy and `r round(100 * (unadj_pclass_coef - access_pclass_coef) / unadj_pclass_coef, 1)`% by access/structural factors. Researchers can build on this framework with more sophisticated mediation models, counterfactual estimation, or qualitative historical evidence to further refine understanding of why class mattered so much in survival outcomes.
+
