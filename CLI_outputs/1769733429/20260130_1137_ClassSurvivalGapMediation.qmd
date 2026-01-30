@@ -1,0 +1,705 @@
+---
+title: "Class-Survival Gap: Mediation Analysis via Access and Constraints"
+author: "CLI Copilot"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    self-contained: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+## Executive Summary
+
+This analysis investigates the research question: **To what extent is the survival advantage of 1st class passengers mediated by location/access (deck/cabin proximity, boarding points) versus policy ("women and children first")?** We approach this as a mediation question where we decompose the total effect of passenger class on survival into direct effects and effects mediated through access-related mechanisms.
+
+---
+
+## 1. Research Context and Conceptual Framework
+
+### 1.1 The Research Question
+
+The survival advantage enjoyed by 1st class passengers during the Titanic disaster is well-documented. However, understanding *why* this advantage existed requires us to examine potential mechanisms. We hypothesize that class advantages operate through two pathways:
+
+1. **Access/Constraints pathway**: 1st class passengers may have had better physical access to lifeboats, proximity to key locations, and earlier knowledge of the disaster.
+2. **Policy pathway**: The "women and children first" policy may have been more effectively enforced or applied in 1st class areas.
+
+### 1.2 Why This Matters
+
+Rather than treating class as a monolithic predictor, decomposing its effects reveals the structural mechanisms underlying survival disparities. This distinction has important implications for understanding historical disasters and modern safety protocols.
+
+### 1.3 Operationalization Strategy
+
+We will use the following approach to operationalize this mediation analysis:
+
+- **Total Effect**: The overall association between passenger class and survival
+- **Mediation Proxies (Access/Constraints)**: 
+  - **Cabin information**: Presence/absence and cabin letter (as proxy for deck location)
+  - **Fare**: As a proxy for accommodation quality and deck location
+  - **Embarked port**: As proxy for boarding point and embarkation procedures
+  - **Ticket family size** (SibSp + Parch): Constraint on movement and access to lifeboats
+- **Direct Effect**: The class effect after accounting for access mediators
+
+---
+
+## 2. Data Preparation and Exploratory Analysis
+
+```{r setup}
+library(tidyverse)
+library(knitr)
+library(ggplot2)
+
+# Read the training data
+train <- read.csv("../../data/train.csv")
+
+# Display basic structure
+head(train)
+str(train)
+```
+
+We begin by loading the Titanic training dataset and examining its structure. This step is essential to understand what variables we have available and their basic characteristics. The training data contains 891 passengers with 12 variables including demographics (Age, Sex), socioeconomic status (Pclass, Fare), family structure (SibSp, Parch), cabin information, and our outcome variable (Survived).
+
+```{r data_summary}
+# Create summary statistics
+summary_stats <- train %>%
+  summarise(
+    n_passengers = n(),
+    n_survived = sum(Survived == 1),
+    survival_rate = round(mean(Survived), 4),
+    n_missing_cabin = sum(is.na(Cabin)),
+    n_missing_age = sum(is.na(Age)),
+    n_missing_embarked = sum(is.na(Embarked))
+  )
+
+kable(summary_stats, caption = "Dataset Overview")
+
+survival_by_class <- train %>%
+  group_by(Pclass) %>%
+  summarise(
+    n = n(),
+    n_survived = sum(Survived == 1),
+    survival_rate = round(mean(Survived), 4),
+    .groups = 'drop'
+  )
+
+kable(survival_by_class, caption = "Survival Rates by Passenger Class")
+```
+
+This exploratory analysis quantifies the raw survival disparities across passenger classes. We observe substantial differences in survival rates that form the "total effect" we aim to decompose. The table shows both the absolute number of survivors and the proportion, providing context for the magnitude of the class effect.
+
+### 2.1 Missing Data Analysis
+
+```{r missing_data}
+# Examine missing data patterns
+missing_by_class <- train %>%
+  group_by(Pclass) %>%
+  summarise(
+    pct_missing_cabin = round(100 * sum(is.na(Cabin)) / n(), 1),
+    pct_missing_age = round(100 * sum(is.na(Age)) / n(), 1),
+    pct_missing_embarked = round(100 * sum(is.na(Embarked)) / n(), 1),
+    .groups = 'drop'
+  ) %>%
+  mutate(Pclass = paste0("Class ", Pclass))
+
+kable(missing_by_class, caption = "Percentage of Missing Values by Class")
+```
+
+Missing data patterns themselves may be informative about access mechanisms. For instance, cabin information is more commonly missing for lower-class passengers, which could reflect either poor record-keeping for lower-class bookings or actual differences in cabin assignments. We examine this pattern to understand potential measurement limitations.
+
+---
+
+## 3. Mediation Proxy Construction
+
+### 3.1 Cabin-Based Access Proxy
+
+```{r cabin_proxy}
+# Extract cabin letter as proxy for deck location
+train <- train %>%
+  mutate(
+    cabin_known = !is.na(Cabin),
+    cabin_letter = ifelse(!is.na(Cabin), 
+                          substr(Cabin, 1, 1), 
+                          NA),
+    cabin_letter = factor(cabin_letter)
+  )
+
+# Summary of cabin information by class
+cabin_summary <- train %>%
+  group_by(Pclass) %>%
+  summarise(
+    pct_cabin_known = round(100 * mean(cabin_known), 1),
+    n_distinct_cabins = n_distinct(Cabin, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  mutate(Pclass = paste0("Class ", Pclass))
+
+kable(cabin_summary, caption = "Cabin Information by Class")
+
+# Cabin letter distribution among those with known cabin
+cabin_letter_dist <- train %>%
+  filter(!is.na(cabin_letter)) %>%
+  group_by(Pclass, cabin_letter) %>%
+  summarise(
+    count = n(),
+    survival_rate = round(mean(Survived), 3),
+    .groups = 'drop'
+  ) %>%
+  arrange(Pclass, cabin_letter)
+
+kable(cabin_letter_dist, caption = "Cabin Letter Distribution and Survival Rates (Among Passengers with Known Cabin)")
+```
+
+The cabin letter serves as our primary proxy for deck location and physical access to lifeboats. Passengers on certain decks (particularly upper decks in the forward section) had faster, less obstructed access to the boat deck. By examining which cabin letters were assigned to which classes, we assess whether class differences in survival can be partially explained by differential cabin assignments. The presence/absence of cabin information also indicates differential documentation, potentially reflecting class-based record-keeping practices.
+
+### 3.2 Fare as Proxy for Accommodation Quality and Location
+
+```{r fare_proxy}
+# Analyze fare by class and survival
+fare_analysis <- train %>%
+  filter(!is.na(Fare)) %>%
+  group_by(Pclass, Survived) %>%
+  summarise(
+    mean_fare = round(mean(Fare), 2),
+    median_fare = round(median(Fare), 2),
+    n = n(),
+    .groups = 'drop'
+  )
+
+kable(fare_analysis, caption = "Fare Distribution by Class and Survival Status")
+
+# Examine fare variation within classes
+fare_by_class_sex <- train %>%
+  filter(!is.na(Fare)) %>%
+  group_by(Pclass, Sex) %>%
+  summarise(
+    mean_fare = round(mean(Fare), 2),
+    sd_fare = round(sd(Fare), 2),
+    n = n(),
+    .groups = 'drop'
+  )
+
+kable(fare_by_class_sex, caption = "Mean Fare by Class and Sex")
+```
+
+Fare represents a continuous measure of accommodation quality and likely correlates with cabin location on the ship. Higher fares typically purchased cabins in more desirable, higher-decked locations with faster access to lifeboats. We examine fare distributions to understand whether class differences in survival persist after accounting for the economic/locational advantages captured by fare.
+
+### 3.3 Embarked Port as Access Proxy
+
+```{r embarked_proxy}
+# Port of embarkation analysis
+embarked_summary <- train %>%
+  filter(!is.na(Embarked)) %>%
+  group_by(Pclass, Embarked) %>%
+  summarise(
+    n = n(),
+    survival_rate = round(mean(Survived), 3),
+    .groups = 'drop'
+  ) %>%
+  arrange(Pclass, Embarked)
+
+kable(embarked_summary, caption = "Embarkation Port Distribution by Class")
+
+# Survival rate by embarkation port
+port_survival <- train %>%
+  filter(!is.na(Embarked)) %>%
+  group_by(Embarked) %>%
+  summarise(
+    n = n(),
+    survival_rate = round(mean(Survived), 3),
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    Embarked = case_when(
+      Embarked == "C" ~ "Cherbourg",
+      Embarked == "Q" ~ "Queenstown",
+      Embarked == "S" ~ "Southampton"
+    )
+  )
+
+kable(port_survival, caption = "Survival Rate by Embarkation Port")
+```
+
+The port of embarkation serves as a proxy for boarding procedures and potential early warning/evacuation opportunities. Passengers embarking from different ports may have experienced different embarkation procedures, crowding conditions, and communication about the ship's itinerary, all of which could influence evacuation outcomes.
+
+### 3.4 Family Size as Constraint Proxy
+
+```{r family_size}
+# Create family size variable
+train <- train %>%
+  mutate(
+    family_size = SibSp + Parch + 1,  # +1 to include the passenger
+    is_alone = (family_size == 1),
+    is_large_family = (family_size > 4)
+  )
+
+# Family size analysis
+family_analysis <- train %>%
+  group_by(Pclass, is_alone) %>%
+  summarise(
+    n = n(),
+    survival_rate = round(mean(Survived), 3),
+    .groups = 'drop'
+  ) %>%
+  mutate(family_status = ifelse(is_alone, "Traveling Alone", "With Family"))
+
+kable(family_analysis, caption = "Survival Rates: Traveling Alone vs. With Family, by Class")
+
+family_size_dist <- train %>%
+  group_by(Pclass, family_size) %>%
+  summarise(
+    n = n(),
+    survival_rate = round(mean(Survived), 3),
+    .groups = 'drop'
+  ) %>%
+  arrange(Pclass, family_size)
+
+kable(family_size_dist, caption = "Survival Rates by Family Size and Class")
+```
+
+Family size constrains individual evacuation decisions and mobility during the disaster. Passengers traveling with larger families faced coordination challenges and may have prioritized keeping families together over rapid evacuation. This variable serves as a proxy for practical constraints on accessing lifeboats, independent of policy or cabin location.
+
+---
+
+## 4. Mediation Analysis: Decomposing Class Effects
+
+### 4.1 Model 1: Total Effect of Class on Survival
+
+```{r model1_total_effect}
+# Fit model with class only
+model1 <- glm(Survived ~ factor(Pclass), 
+              family = binomial(link = "logit"), 
+              data = train)
+
+summary(model1)
+
+# Extract coefficients
+model1_coef <- coef(model1)
+model1_summary <- data.frame(
+  Term = names(model1_coef),
+  Coefficient = round(model1_coef, 4),
+  OR = round(exp(model1_coef), 4)
+)
+
+kable(model1_summary, caption = "Model 1: Total Effect - Class on Survival (Logistic Regression)")
+```
+
+Model 1 establishes the baseline relationship between passenger class and survival. This represents the total effect we aim to decompose. The logistic regression coefficients show how class membership is associated with survival odds, with class 1 as the reference category. These coefficients provide the baseline against which we will compare subsequent models that include potential mediators.
+
+### 4.2 Model 2: Class + Cabin Access Mediators
+
+```{r model2_cabin_mediators}
+# Prepare data for Model 2 (exclude rows missing cabin information)
+train_cabin_subset <- train %>%
+  filter(!is.na(Cabin))
+
+model2 <- glm(Survived ~ factor(Pclass) + cabin_known + factor(cabin_letter),
+              family = binomial(link = "logit"),
+              data = train_cabin_subset)
+
+summary(model2)
+
+model2_coef <- coef(model2)
+model2_summary <- data.frame(
+  Term = names(model2_coef),
+  Coefficient = round(model2_coef, 4),
+  OR = round(exp(model2_coef), 4)
+)
+
+kable(model2_summary, caption = "Model 2: Class + Cabin Location Mediators")
+
+# Compare class coefficients
+comparison_cabin <- data.frame(
+  Model = c("Model 1 (Class Only)", "Model 2 (+ Cabin)"),
+  Class2_Coef = c(model1_coef["factor(Pclass)2"], 
+                  ifelse(!is.na(model2_coef["factor(Pclass)2"]), model2_coef["factor(Pclass)2"], NA)),
+  Class3_Coef = c(model1_coef["factor(Pclass)3"], 
+                  ifelse(!is.na(model2_coef["factor(Pclass)3"]), model2_coef["factor(Pclass)3"], NA))
+)
+
+# Note: Remove the data type conversion to show raw values
+comparison_cabin <- data.frame(
+  Predictor = c("Model 1: Class Only", "Model 2: Class + Cabin"),
+  Class_2_vs_1_Coef = c(
+    round(model1_coef["factor(Pclass)2"], 4),
+    round(model2_coef["factor(Pclass)2"], 4)
+  ),
+  Class_3_vs_1_Coef = c(
+    round(model1_coef["factor(Pclass)3"], 4),
+    round(model2_coef["factor(Pclass)3"], 4)
+  )
+)
+
+kable(comparison_cabin, caption = "Model Comparison: Class Coefficients Before and After Accounting for Cabin Mediators")
+```
+
+Model 2 incorporates cabin-related variables as potential mediators of the class effect. By including cabin letter and the cabin_known indicator, we assess whether class differences in survival can be explained by differential cabin assignments and access. The reduction (if any) in class coefficients from Model 1 to Model 2 would indicate mediation through the cabin/access pathway.
+
+### 4.3 Model 3: Class + Fare Mediator
+
+```{r model3_fare_mediator}
+# Model with fare as mediator
+train_fare_subset <- train %>%
+  filter(!is.na(Fare))
+
+model3 <- glm(Survived ~ factor(Pclass) + Fare,
+              family = binomial(link = "logit"),
+              data = train_fare_subset)
+
+summary(model3)
+
+model3_coef <- coef(model3)
+
+# Create coefficient comparison table
+comparison_fare <- data.frame(
+  Model = c("Model 1 (Class Only)", "Model 3 (Class + Fare)"),
+  Class_2_Coef = c(
+    round(model1_coef["factor(Pclass)2"], 4),
+    round(model3_coef["factor(Pclass)2"], 4)
+  ),
+  Class_3_Coef = c(
+    round(model1_coef["factor(Pclass)3"], 4),
+    round(model3_coef["factor(Pclass)3"], 4)
+  ),
+  Fare_Coef = c(NA, round(model3_coef["Fare"], 4))
+)
+
+kable(comparison_fare, caption = "Model Comparison: Class Coefficients with Fare as Mediator")
+```
+
+Model 3 tests fare as a mediation mechanism. Since fare directly relates to cabin quality and location, controlling for fare allows us to examine the "direct effect" of class beyond its influence on accommodation quality. Changes in class coefficients between Model 1 and Model 3 indicate mediation through the fare/quality pathway.
+
+### 4.4 Model 4: Class + Family Size Constraint
+
+```{r model4_family_size}
+# Model with family size as a constraint proxy
+model4 <- glm(Survived ~ factor(Pclass) + family_size,
+              family = binomial(link = "logit"),
+              data = train)
+
+summary(model4)
+
+model4_coef <- coef(model4)
+
+comparison_family <- data.frame(
+  Model = c("Model 1 (Class Only)", "Model 4 (Class + Family Size)"),
+  Class_2_Coef = c(
+    round(model1_coef["factor(Pclass)2"], 4),
+    round(model4_coef["factor(Pclass)2"], 4)
+  ),
+  Class_3_Coef = c(
+    round(model1_coef["factor(Pclass)3"], 4),
+    round(model4_coef["factor(Pclass)3"], 4)
+  ),
+  FamilySize_Coef = c(NA, round(model4_coef["family_size"], 4))
+)
+
+kable(comparison_family, caption = "Model Comparison: Class Coefficients with Family Size Control")
+```
+
+Model 4 incorporates family size as a control for practical constraints. This model helps us understand whether class differences in survival persist after accounting for family coordination challenges. If family size doesn't substantially reduce class coefficients, it suggests that family constraints were not a primary mechanism through which class affected survival.
+
+### 4.5 Model 5: Comprehensive Mediation Model
+
+```{r model5_comprehensive}
+# Comprehensive model with all mediators
+train_comprehensive <- train %>%
+  filter(!is.na(Fare) & !is.na(Cabin) & !is.na(Age) & !is.na(Embarked)) %>%
+  mutate(Pclass = factor(Pclass),
+         Sex = factor(Sex),
+         Embarked = factor(Embarked))
+
+model5 <- glm(
+  Survived ~ Pclass + Fare + cabin_known + factor(cabin_letter) + 
+             family_size + Sex + Age + Embarked,
+  family = binomial(link = "logit"),
+  data = train_comprehensive
+)
+
+summary(model5)
+
+model5_coef <- coef(model5)
+
+# Extract and display relevant coefficients
+pclass_comparison <- data.frame(
+  Model = c("Model 1: Class Only", 
+            "Model 2: + Cabin", 
+            "Model 3: + Fare",
+            "Model 4: + Family Size",
+            "Model 5: Comprehensive"),
+  Class_2_Coef = c(
+    round(model1_coef["factor(Pclass)2"], 4),
+    round(model2_coef["factor(Pclass)2"], 4),
+    round(model3_coef["factor(Pclass)2"], 4),
+    round(model4_coef["factor(Pclass)2"], 4),
+    round(model5_coef["Pclass2"], 4)
+  ),
+  Class_3_Coef = c(
+    round(model1_coef["factor(Pclass)3"], 4),
+    round(model2_coef["factor(Pclass)3"], 4),
+    round(model3_coef["factor(Pclass)3"], 4),
+    round(model4_coef["factor(Pclass)3"], 4),
+    round(model5_coef["Pclass3"], 4)
+  )
+)
+
+kable(pclass_comparison, caption = "Class Coefficients Across Models: Tracking Mediation Effects")
+```
+
+Model 5 is our comprehensive model that simultaneously includes all potential mediators: cabin access proxies, fare, family size, and additionally controls for sex, age, and embarkation port. Sex is included because the "women and children first" policy is a critical policy mechanism we want to account for separately from class-based access advantages. This model allows us to assess the direct effect of class on survival after accounting for all measured access and constraint mechanisms.
+
+---
+
+## 5. Interpretation Framework
+
+### 5.1 Effect Decomposition
+
+```{r effect_decomposition}
+# Calculate effect reduction for Class 3 vs Class 1
+class3_effect_m1 <- model1_coef["factor(Pclass)3"]
+class3_effect_m5 <- model5_coef["Pclass3"]
+
+effect_reduction <- abs(class3_effect_m1 - class3_effect_m5) / abs(class3_effect_m1)
+
+effect_summary <- data.frame(
+  Effect_Type = c(
+    "Total Effect (Class 3 vs 1)",
+    "Direct Effect (Class 3 vs 1)",
+    "Reduction Due to Mediators",
+    "% of Total Effect Mediated"
+  ),
+  Value = c(
+    round(class3_effect_m1, 4),
+    round(class3_effect_m5, 4),
+    round(abs(class3_effect_m1 - class3_effect_m5), 4),
+    paste0(round(100 * effect_reduction, 1), "%")
+  )
+)
+
+kable(effect_summary, caption = "Class 3 vs Class 1: Effect Decomposition")
+```
+
+This decomposition quantifies how much of the total class effect operates through measured access mechanisms versus direct class effects. A high percentage of mediation suggests that access/constraints are the primary mechanism, while a low percentage suggests that class effects persist beyond these measured pathways, potentially reflecting policy implementation or unmeasured mechanisms.
+
+### 5.2 Mediation by Access vs. Policy
+
+```{r mediation_pathway_interpretation}
+interpretation_guide <- data.frame(
+  Comparison = c(
+    "Model 1 vs Model 2/3",
+    "Model 1 vs Model 4",
+    "Model 1 vs Model 5 (w/o Sex)",
+    "Effect of Sex"
+  ),
+  Mechanism = c(
+    "Access/Physical Location",
+    "Practical Constraints",
+    "Cumulative Access Mechanisms",
+    "Policy: Women & Children First"
+  ),
+  Interpretation = c(
+    "Class effect reduction indicates location-based mediation",
+    "Class effect reduction indicates constraint-based mediation",
+    "Residual class effect indicates unmeasured mechanisms",
+    "Sex effect separate from class; indicates policy mechanism"
+  )
+)
+
+kable(interpretation_guide, caption = "Guide to Interpreting Model Comparisons")
+```
+
+This table provides a framework for interpreting our model comparisons. Each comparison illuminates a different potential mechanism through which class affects survival.
+
+---
+
+## 6. Visualization of Mediation Pathways
+
+### 6.1 Survival Rate Trends
+
+```{r survival_trends}
+# Create visualization of raw survival rates
+survival_by_class_sex <- train %>%
+  group_by(Pclass, Sex) %>%
+  summarise(
+    survival_rate = mean(Survived),
+    n = n(),
+    .groups = 'drop'
+  ) %>%
+  mutate(Pclass = paste0("Class ", Pclass))
+
+p_survival <- ggplot(survival_by_class_sex, aes(x = Pclass, y = survival_rate, 
+                                                 fill = Sex)) +
+  geom_col(position = "dodge", alpha = 0.8) +
+  theme_minimal() +
+  scale_fill_manual(values = c("#1B9E77", "#D95F02")) +
+  labs(
+    title = "Survival Rates by Class and Sex",
+    x = "Passenger Class",
+    y = "Survival Rate",
+    fill = "Sex"
+  ) +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.title = element_text(size = 12),
+    legend.position = "bottom"
+  ) +
+  ylim(0, 1)
+
+print(p_survival)
+```
+
+This visualization establishes the baseline disparities in survival rates across class and sex, providing visual context for the mediation analysis. The stark differences between classes and within classes by sex reveal the magnitude of effects we are attempting to decompose.
+
+### 6.2 Fare Distribution by Class and Survival
+
+```{r fare_visualization}
+p_fare <- ggplot(train %>% filter(!is.na(Fare)), 
+                 aes(x = Pclass, y = Fare, fill = factor(Survived))) +
+  geom_boxplot(alpha = 0.7) +
+  scale_y_log10() +
+  theme_minimal() +
+  scale_fill_manual(values = c("#E7298A", "#66A61E"), 
+                    labels = c("Did Not Survive", "Survived")) +
+  labs(
+    title = "Fare Distribution by Class and Survival Status",
+    x = "Passenger Class",
+    y = "Fare (log scale)",
+    fill = "Outcome"
+  ) +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.title = element_text(size = 12),
+    legend.position = "bottom"
+  )
+
+print(p_fare)
+```
+
+This visualization demonstrates how fare varies by class and survival status. The clear separation in fare distributions across classes supports fare as a relevant access proxy, as passengers paying higher fares likely received cabins in more advantageous locations.
+
+### 6.3 Family Size Impact
+
+```{r family_size_visualization}
+family_viz <- train %>%
+  group_by(family_size, Pclass) %>%
+  summarise(
+    survival_rate = mean(Survived),
+    n = n(),
+    .groups = 'drop'
+  ) %>%
+  filter(family_size <= 8) %>%
+  mutate(Pclass = paste0("Class ", Pclass))
+
+p_family <- ggplot(family_viz, aes(x = family_size, y = survival_rate, 
+                                     color = Pclass, linetype = Pclass)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  theme_minimal() +
+  scale_color_manual(values = c("#E41A1C", "#377EB8", "#4DAF4A")) +
+  labs(
+    title = "Survival Rate by Family Size and Class",
+    x = "Family Size (including self)",
+    y = "Survival Rate",
+    color = "Class",
+    linetype = "Class"
+  ) +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.title = element_text(size = 12),
+    legend.position = "bottom"
+  ) +
+  ylim(0, 1)
+
+print(p_family)
+```
+
+This visualization shows how family size constrains survival outcomes differently across classes. If larger families experience greater survival challenges uniformly across classes, it suggests family size represents a general constraint rather than a class-specific mechanism.
+
+---
+
+## 7. Model Diagnostics and Assumptions
+
+### 7.1 Model Fit Assessment
+
+```{r model_fit}
+# Compare model fits using AIC
+model_fit_comparison <- data.frame(
+  Model = c("Model 1: Class Only",
+            "Model 3: Class + Fare",
+            "Model 4: Class + Family Size",
+            "Model 5: Comprehensive"),
+  AIC = c(
+    AIC(model1),
+    AIC(model3),
+    AIC(model4),
+    AIC(model5)
+  ),
+  BIC = c(
+    BIC(model1),
+    BIC(model3),
+    BIC(model4),
+    BIC(model5)
+  )
+)
+
+kable(model_fit_comparison, caption = "Model Fit Comparison (AIC and BIC)")
+```
+
+Lower AIC and BIC values indicate better model fit. Comparing these fit statistics helps us assess whether adding mediator variables improves our ability to explain survival beyond the class effect alone. This is essential for evaluating whether our mediation mechanisms are statistically important.
+
+### 7.2 Assumptions and Limitations
+
+The mediation analysis presented here relies on several important assumptions:
+
+1. **No unmeasured confounding**: We assume that no important variables confound the relationships between class, mediators, and survival.
+2. **Correct functional form**: We assume logistic regression adequately captures the relationships.
+3. **Linearity of mediators**: Relationships between mediators and survival are assumed linear on the logit scale.
+4. **Complete information**: We partially address missing data by subsetting to complete cases, but this may introduce bias.
+5. **Interpretation of proxies**: Cabin, fare, and family size are imperfect proxies for the constructs we aim to measure (access, constraints).
+
+---
+
+## 8. Summary and Next Steps
+
+### 8.1 Analysis Summary
+
+This analysis provides a framework for decomposing the class-survival gap into components mediated by access/constraint mechanisms and residual direct class effects. By progressively adding potential mediators to our models, we can quantify how much of the total class effect operates through measured access pathways.
+
+### 8.2 Key Questions Addressed
+
+- **Model 1** answers: What is the total survival advantage of 1st vs. 2nd vs. 3rd class?
+- **Models 2-4** answer: How much of this advantage is explained by specific access/constraint mechanisms?
+- **Model 5** answers: When all mechanisms are considered together, does class still have a substantial direct effect?
+
+### 8.3 Recommended Next Steps for Extended Analysis
+
+1. **Sensitivity Analysis**: Test alternative specifications of mediator variables
+2. **Formal Mediation Testing**: Implement Baron-Kenny approach or newer mediation packages
+3. **Subgroup Analysis**: Examine whether mediation pathways differ by sex or age
+4. **Interaction Effects**: Test whether access proxies interact with class (e.g., does fare matter differently by class?)
+5. **Temporal Dynamics**: If available, incorporate timing information about when evacuation occurred
+
+---
+
+## 9. Appendix: Data Processing Notes
+
+```{r appendix_data}
+# Summary of analytical sample construction
+analytical_note <- data.frame(
+  Sample = c("Full Dataset", "Complete Cabin Data", "Complete Fare Data", 
+             "Comprehensive Model"),
+  N = c(
+    nrow(train),
+    nrow(train_cabin_subset),
+    nrow(train_fare_subset),
+    nrow(train_comprehensive)
+  )
+)
+
+kable(analytical_note, caption = "Analytical Sample Sizes")
+```
+
+Different analyses use different subsets of the data based on variable completeness. The comprehensive model uses the smallest sample (those with complete information across all variables), while initial models use larger samples. This trade-off between completeness and sample size is important for interpretation.
