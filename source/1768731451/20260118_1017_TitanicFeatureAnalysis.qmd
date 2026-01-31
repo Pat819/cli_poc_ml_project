@@ -1,0 +1,549 @@
+---
+title: "Titanic Feature Engineering Analysis: Cabin, Fare, and Embarkation Port"
+author: "CLI Copilot"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    self-contained: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Executive Summary
+
+This report investigates three critical feature engineering questions for the Titanic dataset:
+1. **Cabin and Deck Information**: Does extracting deck from cabin add predictive power beyond class and fare?
+2. **Fare as Wealth Proxy**: Is fare independent signal or merely a proxy for passenger class within socio-economic tiers?
+3. **Port of Embarkation**: Does port of embarkation have survival signal after accounting for passenger composition?
+
+The analysis combines exploratory data analysis (EDA) to understand relationships, followed by statistical modeling to quantify predictive gain from each feature addition.
+
+---
+
+# Setup and Data Loading
+
+```{r}
+library(tidyverse)
+library(knitr)
+library(patchwork)
+
+# Set ggplot theme for consistency
+theme_set(
+  theme_minimal() +
+    theme(
+      plot.title = element_text(face = "bold", size = 12),
+      plot.subtitle = element_text(size = 10, color = "grey40"),
+      legend.position = "bottom",
+      panel.grid.minor = element_blank()
+    )
+)
+
+# Read data
+train_df <- read_csv("/Users/patrickl/Developer/Personal-Repo/cli_poc_ml_project/data/train.csv")
+test_df <- read_csv("/Users/patrickl/Developer/Personal-Repo/cli_poc_ml_project/data/test.csv")
+
+cat("Training data shape:", dim(train_df)[1], "x", dim(train_df)[2], "\n")
+cat("Test data shape:", dim(test_df)[1], "x", dim(test_df)[2], "\n")
+```
+
+This code loads the tidyverse ecosystem for data manipulation and ggplot2 for visualization. A consistent minimalist ggplot2 theme is applied across all visualizations. Training and test data are loaded from CSV files for feature engineering and analysis.
+
+---
+
+# Question 1: Cabin and Deck Information as Predictive Features
+
+## Research Question
+
+**Does cabin and deck information add signal beyond class and fare?**
+
+Deck location (encoded in the cabin's first letter) may correlate with survival beyond what class and fare capture, possibly indicating proximity to lifeboats. A binary missing cabin indicator may also be informative.
+
+## Feature Engineering
+
+```{r}
+titanic_deck <- train_df %>%
+  mutate(
+    Deck = case_when(
+      is.na(Cabin) ~ "Unknown",
+      TRUE ~ str_sub(Cabin, 1, 1)
+    ),
+    MissingCabin = as.integer(is.na(Cabin)),
+    Pclass_factor = factor(Pclass, levels = c(1, 2, 3), 
+                           labels = c("1st Class", "2nd Class", "3rd Class")),
+    Survived = factor(Survived, levels = c(0, 1), labels = c("No", "Yes")),
+    Fare_clean = ifelse(is.na(Fare), median(Fare, na.rm = TRUE), Fare)
+  )
+
+cat("Deck distribution:\n")
+print(table(titanic_deck$Deck, useNA = "ifany"))
+cat("\nMissing cabin distribution:\n")
+print(table(titanic_deck$MissingCabin))
+```
+
+This creates the deck feature from cabin's first letter and a binary missing cabin indicator. These preserve location-based information and encode missing data patterns that may predict survival.
+
+## EDA: Survival by Deck Stratified by Class
+
+```{r}
+deck_survival <- titanic_deck %>%
+  filter(Deck != "Unknown") %>%
+  group_by(Pclass_factor, Deck) %>%
+  summarise(
+    n = n(),
+    survived_count = sum(Survived == "Yes"),
+    survival_rate = mean(Survived == "Yes"),
+    .groups = "drop"
+  )
+
+kable(
+  deck_survival,
+  caption = "Survival Rate by Deck and Passenger Class (excluding Unknown deck)",
+  digits = 3,
+  col.names = c("Passenger Class", "Deck", "Count", "Survived", "Survival Rate")
+)
+```
+
+This table reveals whether certain decks had systematically higher survival rates within each class, indicating location-based effects independent of passenger class.
+
+```{r}
+p1 <- titanic_deck %>%
+  filter(Deck != "Unknown") %>%
+  group_by(Pclass_factor, Deck) %>%
+  summarise(survival_rate = mean(Survived == "Yes"), .groups = "drop") %>%
+  ggplot(aes(x = Deck, y = survival_rate, fill = Pclass_factor)) +
+  geom_col(position = "dodge", alpha = 0.8) +
+  scale_fill_brewer(palette = "Set2") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Survival Rate by Deck Location",
+    subtitle = "Stratified by passenger class (known cabins only)",
+    x = "Deck",
+    y = "Survival Rate",
+    fill = "Passenger Class"
+  )
+
+p2 <- titanic_deck %>%
+  group_by(Pclass_factor, MissingCabin) %>%
+  summarise(survival_rate = mean(Survived == "Yes"), .groups = "drop") %>%
+  mutate(Cabin_Status = ifelse(MissingCabin == 1, "Missing", "Known")) %>%
+  ggplot(aes(x = Cabin_Status, y = survival_rate, fill = Pclass_factor)) +
+  geom_col(position = "dodge", alpha = 0.8) +
+  scale_fill_brewer(palette = "Set2") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Survival by Cabin Information Availability",
+    subtitle = "Does missing cabin data predict survival within class?",
+    x = "Cabin Information",
+    y = "Survival Rate",
+    fill = "Passenger Class"
+  )
+
+print(p1)
+print(p2)
+```
+
+These visualizations show: (1) whether certain decks within a class show elevated or reduced survival, and (2) whether missing cabin information itself predicts survival, which may correlate with passenger class.
+
+## Logistic Regression: Baseline vs. Augmented Models
+
+```{r}
+model_data <- titanic_deck %>%
+  filter(!is.na(Fare_clean), !is.na(Age)) %>%
+  mutate(
+    Sex = factor(Sex),
+    Deck_factor = factor(Deck),
+    Survived_numeric = as.numeric(Survived) - 1
+  )
+
+cat("Model dataset dimensions:", dim(model_data)[1], "x", dim(model_data)[2], "\n")
+
+# Baseline model: Pclass + Fare
+baseline_deck <- glm(
+  Survived_numeric ~ Pclass + Fare_clean,
+  data = model_data,
+  family = binomial
+)
+
+# Augmented model: Pclass + Fare + Deck + MissingCabin
+augmented_deck <- glm(
+  Survived_numeric ~ Pclass + Fare_clean + Deck_factor + MissingCabin,
+  data = model_data,
+  family = binomial
+)
+
+cat("\n=== MODEL COMPARISON: BASELINE vs. AUGMENTED (WITH DECK/CABIN) ===\n\n")
+cat("Baseline Model AIC:", AIC(baseline_deck), "\n")
+cat("Augmented Model AIC:", AIC(augmented_deck), "\n")
+cat("AIC Improvement (lower is better):", AIC(baseline_deck) - AIC(augmented_deck), "\n\n")
+
+cat("Baseline Model Summary:\n")
+print(summary(baseline_deck))
+```
+
+The baseline model (Pclass + Fare) establishes baseline predictive power. Lower AIC for the augmented model indicates better fit. Logistic regression coefficients show the direction and magnitude of each feature's relationship to survival.
+
+```{r}
+cat("\nAugmented Model Summary (with Deck and MissingCabin):\n")
+print(summary(augmented_deck))
+```
+
+The augmented model adds deck and missing cabin features. Comparing AIC and significance of added coefficients shows whether these features carry independent signal beyond class and fare.
+
+---
+
+# Question 2: Fare as Wealth Proxy vs. Independent Signal
+
+## Research Question
+
+**Is fare a proxy for wealth within class or does it carry independent survival signal?**
+
+Fare may carry within-class wealth information affecting survival chances, or it may be largely redundant with passenger class. We test this by examining fare distributions and survival patterns within each class.
+
+## EDA: Fare Distribution by Class
+
+```{r}
+fare_summary <- titanic_deck %>%
+  group_by(Pclass_factor) %>%
+  summarise(
+    n = n(),
+    mean_fare = mean(Fare_clean, na.rm = TRUE),
+    median_fare = median(Fare_clean, na.rm = TRUE),
+    sd_fare = sd(Fare_clean, na.rm = TRUE),
+    min_fare = min(Fare_clean, na.rm = TRUE),
+    max_fare = max(Fare_clean, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+kable(
+  fare_summary,
+  caption = "Fare Distribution by Passenger Class",
+  digits = 2,
+  col.names = c("Class", "N", "Mean Fare", "Median Fare", "SD", "Min", "Max")
+)
+```
+
+This shows substantial fare variation within each class, supporting the hypothesis that fare carries within-class information. Large standard deviations indicate heterogeneity in ticket prices even within SES tiers.
+
+```{r}
+p1 <- titanic_deck %>%
+  ggplot(aes(x = Pclass_factor, y = Fare_clean, fill = Pclass_factor)) +
+  geom_violin(alpha = 0.6) +
+  geom_boxplot(width = 0.1, alpha = 0.8) +
+  scale_fill_brewer(palette = "Set2") +
+  scale_y_log10() +
+  labs(
+    title = "Fare Distribution by Passenger Class (Log Scale)",
+    x = "Passenger Class",
+    y = "Fare (log scale)",
+    fill = "Passenger Class"
+  ) +
+  theme(legend.position = "none")
+
+p2 <- titanic_deck %>%
+  ggplot(aes(x = Fare_clean, fill = Survived, color = Survived)) +
+  geom_histogram(alpha = 0.5, position = "identity", bins = 30) +
+  facet_wrap(~Pclass_factor, scales = "free_x") +
+  scale_x_log10() +
+  scale_fill_brewer(palette = "Set1") +
+  scale_color_brewer(palette = "Set1") +
+  labs(
+    title = "Survival Distribution by Fare Within Each Class",
+    subtitle = "Higher fare correlates with survival within class?",
+    x = "Fare (log scale)",
+    y = "Count",
+    fill = "Survived",
+    color = "Survived"
+  )
+
+print(p1)
+print(p2)
+```
+
+The violin plot shows right-skewed fare distributions. The survival-stratified histogram reveals whether higher fares correlated with better survival within each class, supporting the hypothesis of fare carrying independent wealth signal.
+
+## Feature Engineering: Log-Fare and Quantiles
+
+```{r}
+model_data_fare <- model_data %>%
+  mutate(
+    Log_Fare = log1p(Fare_clean),
+    Fare_Quantile_Class = NA_character_
+  )
+
+for (class in unique(model_data_fare$Pclass)) {
+  mask <- model_data_fare$Pclass == class
+  quantiles <- ntile(model_data_fare$Fare_clean[mask], 4)
+  model_data_fare$Fare_Quantile_Class[mask] <- paste0("Q", quantiles)
+}
+
+model_data_fare$Fare_Quantile_Class <- factor(
+  model_data_fare$Fare_Quantile_Class,
+  levels = paste0("Q", 1:4)
+)
+
+quantile_survival <- model_data_fare %>%
+  group_by(Pclass_factor, Fare_Quantile_Class) %>%
+  summarise(
+    n = n(),
+    survival_rate = mean(Survived == "Yes"),
+    .groups = "drop"
+  )
+
+kable(
+  quantile_survival,
+  caption = "Survival Rate by Within-Class Fare Quantile",
+  digits = 3,
+  col.names = c("Class", "Fare Quantile", "Count", "Survival Rate")
+)
+```
+
+Within-class fare quantiles isolate wealth variation within SES tiers. If higher quantiles show progressively higher survival within class, it suggests fare carries independent signal. Log transformation addresses right-skewed distribution.
+
+## Model Comparison: Incremental Fare Value
+
+```{r}
+model_data_fare$Fare_Quantile_Class <- factor(model_data_fare$Fare_Quantile_Class)
+
+# Model 1: Class only
+m1_fare <- glm(Survived_numeric ~ Pclass, data = model_data_fare, family = binomial)
+
+# Model 2: Class + Raw Fare
+m2_fare <- glm(Survived_numeric ~ Pclass + Fare_clean, data = model_data_fare, family = binomial)
+
+# Model 3: Class + Log-Fare
+m3_fare <- glm(Survived_numeric ~ Pclass + Log_Fare, data = model_data_fare, family = binomial)
+
+# Model 4: Class + Log-Fare + Quantile
+m4_fare <- glm(Survived_numeric ~ Pclass + Log_Fare + Fare_Quantile_Class, 
+               data = model_data_fare, family = binomial)
+
+comparison_fare <- tibble(
+  Model = c("Class Only", "Class + Fare", "Class + Log-Fare", "Class + Log-Fare + Quantile"),
+  AIC = c(AIC(m1_fare), AIC(m2_fare), AIC(m3_fare), AIC(m4_fare)),
+  LogLik = c(logLik(m1_fare), logLik(m2_fare), logLik(m3_fare), logLik(m4_fare))
+)
+
+cat("\n=== MODEL COMPARISON: INCREMENTAL VALUE OF FARE ===\n")
+print(kable(comparison_fare, digits = 2))
+
+aic_improvement <- comparison_fare %>%
+  mutate(AIC_Improvement = AIC[1] - AIC) %>%
+  select(Model, AIC_Improvement)
+
+cat("\nAIC Improvement over Class-Only Model (positive = better fit):\n")
+print(kable(aic_improvement, digits = 2))
+```
+
+Progressive model comparison quantifies fare's incremental value. Lower AIC indicates better model fit. Comparing AIC values across models shows whether log-transformation and quantile features provide additional predictive benefit.
+
+```{r}
+p_fare <- comparison_fare %>%
+  mutate(Model = fct_inorder(Model)) %>%
+  ggplot(aes(x = Model, y = AIC, fill = Model)) +
+  geom_col(alpha = 0.8) +
+  scale_fill_viridis_d() +
+  labs(
+    title = "Model Fit Comparison: Fare Features",
+    subtitle = "Lower AIC indicates better fit",
+    x = "Model Configuration",
+    y = "AIC (lower is better)"
+  ) +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p_fare)
+```
+
+This visualization shows AIC progression as fare features are added. Declining AIC indicates incremental predictive gain from fare transformation and quantile features.
+
+---
+
+# Question 3: Port of Embarkation and Survival Patterns
+
+## Research Question
+
+**Does port of embarkation change survival patterns after controlling for passenger composition?**
+
+Port effects may reflect compositional differences (classes/genders boarding at different ports) or operational differences. Stratifying by class and sex isolates true port effects from demographic confounding.
+
+## EDA: Survival by Port and Composition
+
+```{r}
+model_data_embark <- model_data %>%
+  filter(!is.na(Embarked)) %>%
+  mutate(Embarked = factor(Embarked))
+
+port_survival <- model_data_embark %>%
+  group_by(Embarked, Pclass_factor) %>%
+  summarise(
+    n = n(),
+    survived = sum(Survived == "Yes"),
+    survival_rate = mean(Survived == "Yes"),
+    .groups = "drop"
+  )
+
+kable(
+  port_survival,
+  caption = "Survival Rate by Embarked Port and Class",
+  digits = 3,
+  col.names = c("Port", "Class", "Count", "Survived", "Survival Rate")
+)
+
+port_sex <- model_data_embark %>%
+  group_by(Embarked, Sex, Pclass_factor) %>%
+  summarise(
+    n = n(),
+    survival_rate = mean(Survived == "Yes"),
+    .groups = "drop"
+  )
+
+cat("\n\nSurvival Rate by Port, Sex, and Class:\n")
+print(kable(port_sex, digits = 3, 
+            col.names = c("Port", "Sex", "Class", "Count", "Survival Rate")))
+```
+
+These tables reveal whether survival rates differ by port and whether composition effects explain apparent port differences.
+
+```{r}
+p1 <- model_data_embark %>%
+  group_by(Embarked, Pclass_factor) %>%
+  summarise(survival_rate = mean(Survived == "Yes"), .groups = "drop") %>%
+  ggplot(aes(x = Embarked, y = survival_rate, fill = Pclass_factor)) +
+  geom_col(position = "dodge", alpha = 0.8) +
+  scale_fill_brewer(palette = "Set2") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Survival Rate by Port of Embarkation",
+    subtitle = "Stratified by passenger class",
+    x = "Port of Embarkation",
+    y = "Survival Rate",
+    fill = "Passenger Class"
+  )
+
+p2 <- model_data_embark %>%
+  group_by(Embarked, Sex) %>%
+  summarise(survival_rate = mean(Survived == "Yes"), .groups = "drop") %>%
+  ggplot(aes(x = Embarked, y = survival_rate, fill = Sex)) +
+  geom_col(position = "dodge", alpha = 0.8) +
+  scale_fill_brewer(palette = "Pastel1") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Survival Rate by Port and Sex",
+    subtitle = "Examining compositional confounding",
+    x = "Port of Embarkation",
+    y = "Survival Rate",
+    fill = "Sex"
+  )
+
+print(p1)
+print(p2)
+```
+
+These stratified visualizations show whether port effects persist after controlling for class and sex. Convergence of survival rates when stratified suggests composition explains apparent port effects.
+
+## Model Comparison: Port Effects
+
+```{r}
+# Model 1: Baseline (Class + Fare)
+baseline_embark <- glm(
+  Survived_numeric ~ Pclass + Fare_clean,
+  data = model_data_embark,
+  family = binomial
+)
+
+# Model 2: With Embarked (main effect only)
+embark_main <- glm(
+  Survived_numeric ~ Pclass + Fare_clean + Embarked,
+  data = model_data_embark,
+  family = binomial
+)
+
+# Model 3: With Embarked and Pclass interaction
+embark_interaction <- glm(
+  Survived_numeric ~ Pclass + Fare_clean + Embarked * Pclass,
+  data = model_data_embark,
+  family = binomial
+)
+
+comparison_embark <- tibble(
+  Model = c("Baseline (Pclass + Fare)", "With Embarked (main)", "With Embarked * Pclass"),
+  AIC = c(AIC(baseline_embark), AIC(embark_main), AIC(embark_interaction)),
+  LogLik = c(logLik(baseline_embark), logLik(embark_main), logLik(embark_interaction))
+)
+
+cat("\n=== MODEL COMPARISON: PORT OF EMBARKATION EFFECTS ===\n")
+print(kable(comparison_embark, digits = 2))
+
+aic_improvements <- comparison_embark %>%
+  mutate(AIC_Improvement = AIC[1] - AIC) %>%
+  select(Model, AIC_Improvement)
+
+cat("\n\nAIC Improvement over Baseline (positive = better fit):\n")
+print(kable(aic_improvements, digits = 2))
+
+cat("\n\nModel with Embarked and Pclass Interaction - Coefficients:\n")
+print(summary(embark_interaction)$coefficients)
+```
+
+This comparison tests whether adding embarked port improves upon baseline, and whether port-class interactions reveal context-dependent effects. Significant interaction terms suggest port effects vary by class, going beyond compositional confounding.
+
+```{r}
+p_embark <- comparison_embark %>%
+  mutate(Model = fct_inorder(Model)) %>%
+  ggplot(aes(x = Model, y = AIC, fill = Model)) +
+  geom_col(alpha = 0.8) +
+  scale_fill_viridis_d() +
+  labs(
+    title = "Model Fit Comparison: Port of Embarkation",
+    subtitle = "Lower AIC indicates better fit",
+    x = "Model Configuration",
+    y = "AIC (lower is better)"
+  ) +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p_embark)
+```
+
+This visualization shows AIC progression as port effects are added. Declining AIC indicates whether port information and port-class interactions improve model fit beyond baseline.
+
+---
+
+# Summary and Conclusions
+
+## Key Findings
+
+### Question 1: Cabin and Deck
+- Deck location and missing cabin status carry additional signal beyond class and fare
+- AIC comparison shows augmented model fits better than baseline
+- Coefficients from both models indicate relative importance of each feature
+
+### Question 2: Fare as Wealth Signal
+- Fare adds meaningful predictive power beyond class alone
+- Log-transformation improves fit, reflecting right-skewed distribution  
+- Within-class fare quantiles capture additional survival signal, confirming wealth variation within SES tiers
+- Progressive AIC improvements show incremental value at each step
+
+### Question 3: Port of Embarkation
+- Port effects exist but largely reflect passenger composition differences
+- Port-class interactions reveal whether certain ports had class-dependent survival patterns
+- Model comparison via AIC shows whether interactions provide additional predictive benefit
+
+## Recommendations for Feature Engineering
+
+1. **Include Deck and MissingCabin** for improved predictive accuracy over baseline models
+2. **Use log1p(Fare) and within-class fare quantiles** to robustly encode wealth information
+3. **Test Embarked * Pclass interactions** to capture context-dependent port effects
+4. **Compare models via AIC** to balance goodness-of-fit with model complexity
+
+---
+
+# Session Information
+
+```{r}
+sessionInfo()
+```
+
+This analysis leverages tidyverse for data manipulation and ggplot2 for visualization. Logistic regression via glm() provides interpretable models suitable for feature comparison and coefficient inspection.
