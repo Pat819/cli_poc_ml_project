@@ -1,0 +1,553 @@
+---
+title: "Is Fare a Proxy for Wealth Within Class or an Independent Survival Signal? A Titanic Analysis"
+author: "CLI Copilot"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    self-contained: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+## Research Question
+
+Is passenger fare a proxy for wealth within each passenger class, or does it carry an independent survival signal beyond what class alone provides? This analysis examines whether fare provides additional predictive value for survival when considered within class groupings, and whether fare quantiles vary meaningfully across classes.
+
+## Approach
+
+We will conduct this analysis in two main components:
+
+1. **Exploratory Data Analysis (EDA)**: Visualize the relationship between survival, fare, and passenger class. We will examine fare distributions within each class, compare survival rates across fare quantiles within classes, and identify patterns that suggest whether fare is purely a wealth proxy or carries independent survival information.
+
+2. **Modeling & Incremental Value Assessment**: Build logistic regression models with increasing complexity to test whether fare (log-transformed and quantile-ranked within class) provides incremental predictive value over class alone. This quantitative approach will help us determine if fare captures additional survival signal not explained by class membership.
+
+---
+
+## 1. Data Preparation
+
+### Load Libraries
+
+This code chunk loads the R packages necessary for the analysis. We use `tidyverse` for data manipulation and visualization, `ggplot2` for graphics, and `yardstick` for model evaluation metrics. These packages are standard tools in modern R data science workflows and provide functions for clean, readable code.
+
+```{r}
+library(tidyverse)
+library(ggplot2)
+library(yardstick)
+library(knitr)
+
+set.seed(42)
+```
+
+### Load and Explore Data
+
+We load the training dataset from the CSV file. The training data contains the ground truth survival labels, which we need for our analysis and modeling. We then examine the first few rows, check data types, and identify missing values. Understanding the data structure and completeness is essential before conducting any analysis, as missing values can bias our estimates.
+
+```{r}
+train_data <- read.csv("/Users/patrickl/Developer/Personal-Repo/cli_poc_ml_project/data/train.csv")
+
+head(train_data, 10)
+```
+
+```{r}
+glimpse(train_data)
+```
+
+```{r}
+# Check for missing values
+missing_summary <- train_data %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Missing_Count")
+
+knitr::kable(missing_summary, caption = "Missing Values Summary")
+```
+
+### Prepare Analysis Dataset
+
+For this analysis, we focus on the core variables: survival status, passenger class, and fare. We remove rows with missing fare values because fare is central to our research question. We also remove rows with missing class information. The `Survived` variable is numeric (0/1), `Pclass` is converted to a factor for clarity, and `Fare` is kept as numeric for now. This filtered dataset contains `r nrow(train_data) - sum(is.na(train_data$Fare) | is.na(train_data$Pclass))` passengers with complete information for all three variables.
+
+```{r}
+# Prepare data for analysis
+analysis_data <- train_data %>%
+  select(Survived, Pclass, Fare) %>%
+  mutate(Pclass = factor(Pclass, levels = c(1, 2, 3), labels = c("1st Class", "2nd Class", "3rd Class"))) %>%
+  filter(!is.na(Fare) & !is.na(Pclass)) %>%
+  mutate(Survived = factor(Survived, levels = c(0, 1), labels = c("Did Not Survive", "Survived")))
+
+nrow_analysis <- nrow(analysis_data)
+nrow_analysis
+```
+
+---
+
+## 2. Exploratory Data Analysis
+
+### 2.1 Summary Statistics by Class
+
+To understand whether fare varies meaningfully across classes and how survival relates to both variables, we compute summary statistics. These statistics provide the foundation for our visual exploration and help identify patterns in the data. By examining fare quantiles (25th, 50th, and 75th percentiles) within each class, we can see whether the distribution and range of fares differ substantially across classes. This is important because if classes are perfectly separated by fare (each class has a distinct fare range), then fare within a class might be largely redundant with class. Conversely, if fare ranges overlap substantially within classes, it suggests fare carries independent information about passenger wealth or status within each class.
+
+```{r}
+# Summary statistics by class
+fare_class_summary <- analysis_data %>%
+  group_by(Pclass) %>%
+  summarise(
+    n = n(),
+    Mean_Fare = mean(Fare),
+    Median_Fare = median(Fare),
+    SD_Fare = sd(Fare),
+    Min_Fare = min(Fare),
+    Max_Fare = max(Fare),
+    Q25_Fare = quantile(Fare, 0.25),
+    Q75_Fare = quantile(Fare, 0.75),
+    .groups = "drop"
+  )
+
+knitr::kable(fare_class_summary, 
+             caption = "Fare Summary Statistics by Passenger Class",
+             digits = 2)
+```
+
+### 2.2 Survival Rate by Class
+
+Before examining fare, we establish the baseline relationship between class and survival. This shows how much of the survival signal class alone captures. We calculate the proportion of passengers who survived in each class. Class will be our baseline model, and we will later test whether adding fare improves predictions. This establishes a reference point for assessing the incremental value of fare.
+
+```{r}
+survival_by_class <- analysis_data %>%
+  group_by(Pclass, Survived) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = Survived, values_from = n, values_fill = 0) %>%
+  mutate(
+    Total = `Did Not Survive` + `Survived`,
+    Survival_Rate = `Survived` / Total
+  )
+
+knitr::kable(survival_by_class,
+             caption = "Survival Counts and Rates by Passenger Class",
+             digits = 3)
+```
+
+### 2.3 Fare Distribution by Class and Survival
+
+To assess whether fare is a proxy for wealth within class or carries independent survival signal, we create a visualization showing fare distributions split by both class and survival status. This plot reveals whether passengers who survived tend to have higher fares within each class, which would suggest fare carries survival information beyond class. We use box plots because they effectively show the distribution, median, and outliers while allowing comparison across multiple groups simultaneously.
+
+```{r}
+ggplot(analysis_data, aes(x = Pclass, y = Fare, fill = Survived)) +
+  geom_boxplot(alpha = 0.7, position = "dodge") +
+  scale_fill_viridis_d(direction = -1, option = "plasma") +
+  labs(
+    title = "Fare Distribution by Class and Survival Status",
+    x = "Passenger Class",
+    y = "Fare (£)",
+    fill = "Outcome",
+    caption = "Box plots show median (thick line), IQR (box), and outliers"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold", size = 12)
+  )
+```
+
+### 2.4 Fare Quantiles Within Class
+
+To rigorously test whether fare carries independent survival signal within each class, we create fare quantiles (quartiles) specific to each class. This approach recognizes that what constitutes a "high" or "low" fare is class-dependent. A second-class passenger paying £20 might be at a different wealth level than a third-class passenger paying £20. By creating quantile ranks within each class, we can compare survival rates across fare levels while controlling for the inherent differences in fare scales across classes. This is a standard approach in econometrics and epidemiology for handling variables with different scales across groups.
+
+```{r}
+# Create fare quantiles within each class
+analysis_data <- analysis_data %>%
+  group_by(Pclass) %>%
+  mutate(
+    Fare_Quantile_Within_Class = ntile(Fare, 4)  # Quartiles
+  ) %>%
+  ungroup() %>%
+  mutate(
+    Fare_Quantile_Label = case_when(
+      Fare_Quantile_Within_Class == 1 ~ "Q1 (Lowest)",
+      Fare_Quantile_Within_Class == 2 ~ "Q2",
+      Fare_Quantile_Within_Class == 3 ~ "Q3",
+      Fare_Quantile_Within_Class == 4 ~ "Q4 (Highest)"
+    )
+  )
+
+head(analysis_data, 10)
+```
+
+### 2.5 Survival Rate by Fare Quantile Within Class
+
+Now we calculate survival rates for each combination of class and fare quantile. If fare carries independent survival signal, we should observe that within each class, survival rates increase as we move from lower to higher fare quantiles. This would suggest that even among passengers in the same class, those who paid higher fares (and thus likely had greater wealth or purchasing power) were more likely to survive. Conversely, if survival rates are similar across fare quantiles within each class, it would suggest that fare is simply a proxy for class and carries no independent signal.
+
+```{r}
+survival_by_fare_quantile <- analysis_data %>%
+  group_by(Pclass, Fare_Quantile_Label, Survived) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = Survived, values_from = n, values_fill = 0) %>%
+  mutate(
+    Total = `Did Not Survive` + `Survived`,
+    Survival_Rate = round(`Survived` / Total, 3)
+  ) %>%
+  select(Pclass, Fare_Quantile_Label, `Did Not Survive`, `Survived`, Total, Survival_Rate)
+
+# Manually reorder for readability
+survival_by_fare_quantile$Fare_Quantile_Label <- factor(
+  survival_by_fare_quantile$Fare_Quantile_Label,
+  levels = c("Q1 (Lowest)", "Q2", "Q3", "Q4 (Highest)")
+)
+survival_by_fare_quantile <- survival_by_fare_quantile %>% arrange(Pclass, Fare_Quantile_Label)
+
+knitr::kable(survival_by_fare_quantile,
+             caption = "Survival Rates by Class and Fare Quantile (Within-Class)",
+             digits = 3)
+```
+
+### 2.6 Visualization: Survival Rate vs Fare Quantile by Class
+
+This visualization displays survival rates across fare quantiles within each class. We use line plots to show trends, making it easy to see whether survival increases with fare quantile within each class. A clear upward trend within each class would indicate that fare carries independent survival signal. Conversely, flat or inconsistent trends would suggest that class alone explains the survival patterns.
+
+```{r}
+# Prepare data for visualization
+survival_trends <- analysis_data %>%
+  group_by(Pclass, Fare_Quantile_Label) %>%
+  summarise(
+    Survival_Rate = sum(Survived == "Survived") / n(),
+    n = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Fare_Quantile_Label = factor(
+      Fare_Quantile_Label,
+      levels = c("Q1 (Lowest)", "Q2", "Q3", "Q4 (Highest)")
+    )
+  )
+
+ggplot(survival_trends, aes(x = Fare_Quantile_Label, y = Survival_Rate, color = Pclass, group = Pclass)) +
+  geom_line(size = 1) +
+  geom_point(size = 3) +
+  scale_color_viridis_d(direction = -1, option = "viridis") +
+  scale_y_continuous(limits = c(0, 1), labels = scales::percent) +
+  labs(
+    title = "Survival Rate Trends Across Fare Quantiles Within Each Class",
+    x = "Fare Quantile (Within Class)",
+    y = "Survival Rate",
+    color = "Passenger Class",
+    caption = "Each line represents a passenger class; points show survival rate for each fare quartile"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold", size = 12),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+
+### 2.7 Violin Plot: Distribution of Fares by Survival Within Each Class
+
+To further explore the within-class relationship between fare and survival, we create violin plots that show the full distribution of fares for survivors versus non-survivors within each class. Violin plots provide a richer view of the data distribution than box plots, showing the density of observations at each fare level. If fare carries independent survival signal, we would expect survivors to have higher fare density in the upper ranges within each class, and non-survivors to have higher density in the lower ranges.
+
+```{r}
+ggplot(analysis_data, aes(x = Survived, y = Fare, fill = Survived)) +
+  geom_violin(alpha = 0.7) +
+  facet_wrap(~Pclass, scales = "free_y") +
+  scale_fill_viridis_d(direction = -1, option = "plasma") +
+  labs(
+    title = "Fare Distribution by Survival Status Within Each Class",
+    x = "Survival Status",
+    y = "Fare (£)",
+    fill = "Outcome",
+    caption = "Faceted by passenger class; width indicates density at each fare level"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold", size = 12),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+
+---
+
+## 3. Modeling: Incremental Value Assessment
+
+### 3.1 Log-Transform Fare
+
+Before modeling, we log-transform fare using `log1p()` (log of 1+x) to handle the skewed distribution of fares and improve model interpretability. Fares are right-skewed (some very high outliers), and log-transformation compresses this skewness, making the relationship with survival more linear on the log scale. The log1p function is used instead of plain log because some fares may be very close to zero, and log(0) is undefined. This transformation is standard in econometrics and machine learning when modeling monetary variables.
+
+```{r}
+analysis_data <- analysis_data %>%
+  mutate(Log_Fare = log1p(Fare))
+
+# Show comparison
+fare_transform_comparison <- analysis_data %>%
+  select(Fare, Log_Fare) %>%
+  head(15)
+
+knitr::kable(fare_transform_comparison,
+             caption = "Fare vs Log-Transformed Fare (First 15 Rows)",
+             digits = 3)
+```
+
+### 3.2 Model 1: Baseline Model with Class Only
+
+We start with a logistic regression model using only passenger class as a predictor. This is our baseline against which we will measure the incremental value of fare. The model predicts the log-odds of survival as a linear function of class. Class is entered as a categorical variable with two dummy variables (1st class and 2nd class, with 3rd class as the reference). This model represents what we can predict knowing only a passenger's ticket class.
+
+```{r}
+# Model 1: Class only
+model_class_only <- glm(Survived ~ Pclass, 
+                        family = binomial, 
+                        data = analysis_data)
+
+summary(model_class_only)
+```
+
+### 3.3 Model 2: Class + Log(Fare)
+
+Next, we add log-transformed fare to the model. This model allows the log-odds of survival to vary with both class and fare. If the fare coefficient is statistically significant and the model fit improves, it suggests that fare carries information about survival independent of class. The coefficient on log-fare tells us how much the log-odds of survival increase for each unit increase in log-fare (i.e., a 1% increase in fare).
+
+```{r}
+# Model 2: Class + Log Fare
+model_class_logfare <- glm(Survived ~ Pclass + Log_Fare, 
+                           family = binomial, 
+                           data = analysis_data)
+
+summary(model_class_logfare)
+```
+
+### 3.4 Model 3: Class + Fare Quantile Within Class
+
+This model replaces raw log-fare with fare quantiles created within each class. This approach is more interpretable for our research question because it explicitly tests whether relative wealth within a class (rather than absolute fare) predicts survival. The quantile variable is treated as ordinal, so the model assumes a linear trend in log-odds as we move from lower to higher fare quantiles. This tests whether, within each class, passengers in higher fare quartiles had higher survival probabilities.
+
+```{r}
+# Convert Fare_Quantile_Within_Class to numeric for regression
+analysis_data_model <- analysis_data %>%
+  mutate(Fare_Quantile_Numeric = as.numeric(Fare_Quantile_Within_Class))
+
+# Model 3: Class + Fare Quantile Within Class
+model_class_quantile <- glm(Survived ~ Pclass + Fare_Quantile_Numeric, 
+                            family = binomial, 
+                            data = analysis_data_model)
+
+summary(model_class_quantile)
+```
+
+### 3.5 Model 4: Class + Log(Fare) + Class:Log(Fare) Interaction
+
+This model includes an interaction term between class and log-fare. This tests whether the relationship between fare and survival differs across classes. If the interaction is significant, it would indicate that fare's effect on survival is not uniform across classes—for example, fare might be more predictive of survival in 1st class than in 3rd class. This is theoretically meaningful because survival mechanisms might have differed by class (e.g., better access to lifeboats for higher classes could make within-class fare less predictive of survival).
+
+```{r}
+# Model 4: Class + Log Fare + Interaction
+model_class_logfare_interaction <- glm(Survived ~ Pclass * Log_Fare, 
+                                       family = binomial, 
+                                       data = analysis_data)
+
+summary(model_class_logfare_interaction)
+```
+
+### 3.6 Model Comparison: AIC and Likelihood Ratio Tests
+
+To determine which model provides the best fit and whether additional variables meaningfully improve predictions, we compare models using AIC (Akaike Information Criterion) and likelihood ratio tests. AIC balances model fit with complexity—lower AIC indicates a better trade-off. Likelihood ratio tests explicitly test whether adding variables significantly improves the fit. A significant p-value (< 0.05) means the added variable(s) significantly improve the model. This quantitative approach helps us judge whether fare's explanatory power is substantial enough to justify its inclusion.
+
+```{r}
+# Extract model information for comparison
+model_comparison <- tibble(
+  Model = c("Class Only", 
+            "Class + Log(Fare)", 
+            "Class + Fare Quantile", 
+            "Class + Log(Fare) + Interaction"),
+  AIC = c(AIC(model_class_only),
+          AIC(model_class_logfare),
+          AIC(model_class_quantile),
+          AIC(model_class_logfare_interaction)),
+  BIC = c(BIC(model_class_only),
+          BIC(model_class_logfare),
+          BIC(model_class_quantile),
+          BIC(model_class_logfare_interaction)),
+  Deviance = c(model_class_only$deviance,
+               model_class_logfare$deviance,
+               model_class_quantile$deviance,
+               model_class_logfare_interaction$deviance)
+)
+
+knitr::kable(model_comparison,
+             caption = "Model Comparison: Information Criteria",
+             digits = 2)
+```
+
+### 3.7 Likelihood Ratio Tests
+
+We conduct formal hypothesis tests comparing nested models. Each test examines whether adding variables significantly improves fit. The null hypothesis is that the simpler model is adequate; a rejection (p < 0.05) suggests the additional variables are statistically significant.
+
+```{r}
+# LRT: Class Only vs Class + Log Fare
+lrt_logfare <- anova(model_class_only, model_class_logfare, test = "Chisq")
+cat("Likelihood Ratio Test: Class Only vs Class + Log(Fare)\n")
+print(lrt_logfare)
+```
+
+```{r}
+# LRT: Class Only vs Class + Fare Quantile
+lrt_quantile <- anova(model_class_only, model_class_quantile, test = "Chisq")
+cat("\nLikelihood Ratio Test: Class Only vs Class + Fare Quantile\n")
+print(lrt_quantile)
+```
+
+```{r}
+# LRT: Class + Log Fare vs Class + Log Fare + Interaction
+lrt_interaction <- anova(model_class_logfare, model_class_logfare_interaction, test = "Chisq")
+cat("\nLikelihood Ratio Test: Class + Log(Fare) vs Class + Log(Fare) + Interaction\n")
+print(lrt_interaction)
+```
+
+### 3.8 Model Predictions: Predicted Probabilities
+
+To understand the practical magnitude of fare's effect, we generate predicted survival probabilities from our models for representative passengers. We hold class constant and vary fare to see how predicted survival probability changes. This helps translate statistical significance into meaningful practical differences. For instance, if increasing from the 1st to 4th fare quartile increases predicted survival probability by 15% in 3rd class, it would suggest a substantial practical effect.
+
+```{r}
+# Create prediction scenarios
+prediction_scenarios <- expand.grid(
+  Pclass = factor(c("1st Class", "2nd Class", "3rd Class"), 
+                  levels = c("1st Class", "2nd Class", "3rd Class")),
+  Log_Fare = seq(0, 5, by = 1)
+)
+
+# Add predictions from model with log fare
+prediction_scenarios$Pred_Prob_LogFare <- predict(model_class_logfare, 
+                                                   newdata = prediction_scenarios, 
+                                                   type = "response")
+
+# Create scenario table
+pred_table <- prediction_scenarios %>%
+  mutate(
+    Fare_Approx = round(expm1(Log_Fare), 2),
+    Predicted_Survival_Prob = round(Pred_Prob_LogFare, 3)
+  ) %>%
+  select(Pclass, Fare_Approx, Predicted_Survival_Prob)
+
+knitr::kable(pred_table,
+             caption = "Predicted Survival Probability by Class and Fare (Model: Class + Log Fare)",
+             digits = 3)
+```
+
+### 3.9 Visualization: Predicted Probabilities by Class and Fare
+
+We visualize the predicted survival probability as a function of log-fare for each class. This plot shows the gradient of the logistic regression lines, making it visually clear how strongly fare predicts survival within each class and whether this relationship differs across classes. Steeper slopes indicate stronger fare effects; parallel lines would indicate no interaction between class and fare.
+
+```{r}
+# Finer grid for smooth curves
+prediction_smooth <- expand.grid(
+  Pclass = factor(c("1st Class", "2nd Class", "3rd Class"), 
+                  levels = c("1st Class", "2nd Class", "3rd Class")),
+  Log_Fare = seq(0, 5, by = 0.1)
+)
+
+prediction_smooth$Pred_Prob <- predict(model_class_logfare, 
+                                       newdata = prediction_smooth, 
+                                       type = "response")
+
+ggplot(prediction_smooth, aes(x = Log_Fare, y = Pred_Prob, color = Pclass)) +
+  geom_line(size = 1) +
+  scale_color_viridis_d(direction = -1, option = "viridis") +
+  scale_y_continuous(limits = c(0, 1), labels = scales::percent) +
+  labs(
+    title = "Predicted Survival Probability vs Log(Fare) by Class",
+    subtitle = "Model: Logistic Regression with Class + Log(Fare)",
+    x = "Log(Fare)",
+    y = "Predicted Survival Probability",
+    color = "Passenger Class",
+    caption = "Lines show predicted probability from logistic model"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold", size = 12)
+  )
+```
+
+### 3.10 Effect Size: Magnitude of Fare Advantage
+
+To quantify the practical importance of fare as a predictor, we calculate the predicted survival probability difference for passengers in the same class but different fare quantiles. Specifically, we compare survival probabilities for passengers in Q1 (lowest fare) versus Q4 (highest fare) within each class. This provides a concrete answer to the research question: controlling for class, how much does higher fare increase survival probability?
+
+```{r}
+# Create scenarios: Q1 vs Q4 within each class
+quantile_analysis <- analysis_data_model %>%
+  group_by(Pclass, Fare_Quantile_Within_Class) %>%
+  summarise(
+    Mean_Log_Fare = mean(Log_Fare),
+    .groups = "drop"
+  )
+
+q1_q4_scenarios <- quantile_analysis %>%
+  filter(Fare_Quantile_Within_Class %in% c(1, 4)) %>%
+  pivot_wider(
+    names_from = Fare_Quantile_Within_Class,
+    values_from = Mean_Log_Fare,
+    names_prefix = "Q"
+  )
+
+# Predict for Q1 and Q4
+pred_q1 <- expand.grid(
+  Pclass = factor(c("1st Class", "2nd Class", "3rd Class"), 
+                  levels = c("1st Class", "2nd Class", "3rd Class")),
+  Log_Fare = quantile_analysis %>%
+    filter(Fare_Quantile_Within_Class == 1) %>%
+    pull(Mean_Log_Fare)
+) %>%
+  mutate(Quantile = "Q1")
+
+pred_q4 <- expand.grid(
+  Pclass = factor(c("1st Class", "2nd Class", "3rd Class"), 
+                  levels = c("1st Class", "2nd Class", "3rd Class")),
+  Log_Fare = quantile_analysis %>%
+    filter(Fare_Quantile_Within_Class == 4) %>%
+    pull(Mean_Log_Fare)
+) %>%
+  mutate(Quantile = "Q4")
+
+pred_combined <- bind_rows(pred_q1, pred_q4) %>%
+  mutate(Pred_Prob = predict(model_class_logfare, newdata = ., type = "response"))
+
+fare_advantage <- pred_combined %>%
+  pivot_wider(
+    names_from = Quantile,
+    values_from = Pred_Prob
+  ) %>%
+  mutate(
+    Difference_PP = round(Q4 - Q1, 3),
+    Relative_Increase = round((Q4 - Q1) / Q1, 3)
+  ) %>%
+  select(Pclass, Q1, Q4, Difference_PP, Relative_Increase)
+
+knitr::kable(fare_advantage,
+             caption = "Survival Advantage: Q4 vs Q1 Fare (Predicted Probabilities)",
+             digits = 3)
+```
+
+---
+
+## 4. Summary and Interpretation
+
+### Key Findings
+
+1. **Fare varies substantially within classes**: As shown in the summary statistics, each passenger class contains a range of fares, suggesting that fare captures variation in passenger wealth or status within class, not just between classes.
+
+2. **Survival trends across fare quantiles**: The visualization of survival rates by fare quantile within class reveals whether fare carries independent survival signal. Clear upward trends within each class would indicate that fare has explanatory power beyond class alone.
+
+3. **Statistical significance of fare**: The likelihood ratio tests show whether adding fare (in either log or quantile form) significantly improves model fit compared to class alone. A significant test result indicates that fare is not merely redundant with class.
+
+4. **Practical magnitude of fare effects**: The predicted probability comparisons quantify how much higher fares increase survival chances when class is held constant. These differences indicate whether the statistical signal from fare translates to meaningful practical differences in survival prediction.
+
+### Data-Driven Decision Framework
+
+To answer the research question comprehensively:
+
+- If survival rates increase monotonically within each class as fare increases, and if the likelihood ratio tests show significant improvement from adding fare, this would suggest fare carries independent survival signal beyond class.
+- If survival rates are flat or erratic across fare quantiles within classes, or if adding fare does not significantly improve model fit, this would suggest fare is primarily a proxy for class.
+- The magnitude of predicted probability differences between low and high fare passengers in the same class indicates the practical importance of this independent signal.
+
+The analysis provides the factual foundation and quantitative tools needed to evaluate these patterns and draw evidence-based conclusions about the nature of fare's relationship with survival.
+
+---
+
+*Analysis completed with R `r R.version$version.string`*
+*Data contains `r nrow_analysis` passengers with complete fare and class information*
