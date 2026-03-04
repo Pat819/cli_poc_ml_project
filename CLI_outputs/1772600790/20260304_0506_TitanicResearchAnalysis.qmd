@@ -1,0 +1,680 @@
+---
+title: "Titanic Survival Analysis: Mechanisms Behind Class-Survival Gap and Rule Consistency"
+author: "CLI Copilot"
+date: "2026-03-04"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    self-contained: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+## Introduction
+
+This report investigates two interconnected research questions about the Titanic disaster:
+
+1. **Mediation Question**: How much of the class–survival gap is explained by access and constraints (location, proximity, boarding points) versus policy-based priority rules ("women and children first")?
+
+2. **Consistency Question**: Were survival rules applied consistently, or did their effectiveness depend on social visibility and group context?
+
+These questions shift focus from *what* the patterns were to *why* they existed—reframing class effects as a mechanism question. We will design analytical steps that help answer these questions by examining proxies for access, policy application, and social visibility.
+
+---
+
+## Part 1: Data Preparation and Feature Engineering
+
+### 1.1 Loading and Exploring the Raw Data
+
+```{r load_and_explore}
+library(tidyverse)
+library(knitr)
+library(RColorBrewer)
+
+# Load training data
+titanic_raw <- read_csv("../../data/train.csv")
+
+# Display basic structure
+cat("Dataset dimensions:", nrow(titanic_raw), "rows x", ncol(titanic_raw), "columns\n\n")
+
+cat("Data types and missing values:\n")
+missing_summary <- titanic_raw %>%
+  summarise(across(everything(), list(
+    missing_count = ~sum(is.na(.)),
+    missing_pct = ~round(100 * sum(is.na(.)) / n(), 1)
+  )))
+
+missing_df <- data.frame(
+  Variable = names(titanic_raw),
+  Missing_Count = as.numeric(missing_summary[1, seq(1, ncol(missing_summary), 2)]),
+  Missing_Pct = as.numeric(missing_summary[1, seq(2, ncol(missing_summary), 2)])
+)
+kable(missing_df, caption = "Missing Data Summary")
+```
+
+**Explanation**: We begin by loading the Titanic training dataset and examining its structure. Understanding data completeness is critical because missing values in key variables (especially **Cabin** and **Age**) directly affect our ability to measure access proxies and demographic characteristics. The missing data patterns themselves are informative—cabin missingness, for instance, may indicate lower-class status or lack of explicit boarding documentation.
+
+### 1.2 Comprehensive Feature Engineering
+
+All features needed for mediation and consistency analyses are constructed here to ensure consistency across all downstream models.
+
+```{r feature_engineering}
+# Create comprehensive feature-engineered dataset
+titanic <- titanic_raw %>%
+  mutate(
+    # Cabin-based proxies
+    Has_Cabin_Info = !is.na(Cabin),
+    Cabin_Deck = ifelse(!is.na(Cabin), str_extract(Cabin, "^[A-Z]"), NA),
+    
+    # Fare as proxy for location quality and booking specificity
+    Fare_Category = case_when(
+      Fare == 0 ~ "Zero",
+      Fare > 0 & Fare <= 7.91 ~ "Low",
+      Fare > 7.91 & Fare <= 14.454 ~ "Lower-Mid",
+      Fare > 14.454 & Fare <= 31 ~ "Mid",
+      Fare > 31 ~ "High",
+      is.na(Fare) ~ "Missing"
+    ),
+    
+    # Group size from sibling/spouse and parent/child counts
+    Family_Size = 1 + SibSp + Parch,
+    Travel_Alone = Family_Size == 1,
+    
+    # Embarkation as proxy for route/access to specific decks
+    Embarked_Label = case_when(
+      Embarked == "C" ~ "Cherbourg",
+      Embarked == "Q" ~ "Queenstown",
+      Embarked == "S" ~ "Southampton",
+      is.na(Embarked) ~ "Missing"
+    ),
+    
+    # Age categories for demographic stratification
+    Age_Group = case_when(
+      is.na(Age) ~ "Unknown",
+      Age < 13 ~ "Child",
+      Age >= 13 & Age < 18 ~ "Teen",
+      Age >= 18 & Age < 65 ~ "Adult",
+      Age >= 65 ~ "Elderly"
+    ),
+    
+    # Extract title from passenger names
+    Title = str_extract(Name, "[A-Z][a-z]+(?=\\.)"),
+    # Standardize rare titles
+    Title_Grouped = case_when(
+      Title %in% c("Mr", "Mrs", "Miss", "Master") ~ Title,
+      Title %in% c("Dr", "Rev", "Col", "Major", "Capt") ~ "Officer/Professional",
+      Title %in% c("Mme", "Mlle", "Ms") ~ "Mrs/Miss",
+      Title %in% c("Sir", "Lady", "Countess", "Dona") ~ "Nobility",
+      TRUE ~ "Other"
+    )
+  ) %>%
+  select(PassengerId, Name, Survived, Pclass, Sex, Age, Age_Group, 
+         Family_Size, Travel_Alone, Has_Cabin_Info, Cabin_Deck, 
+         Fare, Fare_Category, Embarked_Label, Title, Title_Grouped, 
+         SibSp, Parch)
+
+# Create clean analysis dataset (removing rows with missing Survived or Pclass)
+titanic_analysis <- titanic %>%
+  filter(!is.na(Survived), !is.na(Pclass)) %>%
+  mutate(Survived = as.numeric(Survived))
+
+cat("Feature-engineered dataset created successfully.\n")
+cat("Analysis dataset dimensions:", nrow(titanic_analysis), "rows x", ncol(titanic_analysis), "columns\n\n")
+
+cat("Title Distribution by Class:\n")
+title_dist <- titanic_analysis %>%
+  group_by(Title_Grouped, Pclass) %>%
+  summarise(Count = n(), .groups = 'drop') %>%
+  pivot_wider(names_from = Pclass, values_from = Count, values_fill = 0) %>%
+  rename("1st Class" = "1", "2nd Class" = "2", "3rd Class" = "3")
+kable(title_dist, caption = "Passenger Titles by Class")
+```
+
+**Explanation**: This comprehensive feature engineering step creates all variables needed for both mediation and consistency analyses. Cabin information and fare serve as **access proxies** (representing location/proximity constraints); family size represents **group context**; titles represent **social visibility**; age groups represent **demographic priority** under stated policy. By creating all features upfront, we ensure consistency across all downstream models and can clearly trace how each feature relates to our research questions.
+
+---
+
+## Part 2: Understanding the Class-Survival Gap Baseline
+
+### 2.1 Calculating the Baseline Class-Survival Gap
+
+Before examining mechanisms, we establish the baseline outcome we are trying to explain.
+
+```{r baseline_class_gap}
+# Calculate survival rates by class
+class_survival <- titanic_analysis %>%
+  group_by(Pclass) %>%
+  summarise(
+    N = n(),
+    Survived_Count = sum(Survived == 1),
+    Died = sum(Survived == 0),
+    Survival_Rate = mean(Survived),
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    Class_Label = case_when(
+      Pclass == 1 ~ "1st Class",
+      Pclass == 2 ~ "2nd Class",
+      Pclass == 3 ~ "3rd Class"
+    )
+  )
+
+kable(class_survival, 
+      caption = "Survival Rates by Passenger Class",
+      digits = 3)
+
+# Calculate the gap between 1st and 3rd class
+gap_1st_vs_3rd <- filter(class_survival, Pclass == 1)$Survival_Rate - 
+                  filter(class_survival, Pclass == 3)$Survival_Rate
+
+cat("\n\nClass-Survival Gap (1st vs 3rd): ", round(gap_1st_vs_3rd, 3))
+cat("\nThis raw gap of approximately", round(gap_1st_vs_3rd * 100, 1), 
+    "percentage points is what we will decompose into access versus policy mechanisms.\n")
+```
+
+**Explanation**: This section establishes the baseline outcome—a survival rate gap of approximately `r round(gap_1st_vs_3rd * 100, 1)` percentage points between 1st and 3rd class passengers. This raw gap is what we decompose in subsequent sections. By comparing models that exclude versus include access and policy mechanisms, we estimate how much each pathway contributes to the total class effect. If access proxies explain most of the gap, it suggests location/constraint mechanisms were primary; if policy effects dominate, it suggests priority rules were primary.
+
+---
+
+## Part 3: Testing Access Mediation Mechanisms
+
+### 3.1 Conceptual Framework for Access Proxies
+
+Access proxies represent physical and logistical constraints that may have enabled or impeded survival, independent of explicit priority rules. We use fare (booking specificity), cabin information (location documentation), and family size (group coordination) as proxies.
+
+```{r access_proxies_summary}
+cat("Access Proxies and Their Rationale:\n")
+cat("====================================\n\n")
+
+cat("1. CABIN INFORMATION:\n")
+cabin_stats <- titanic_analysis %>%
+  group_by(Pclass, Has_Cabin_Info) %>%
+  summarise(Count = n(), .groups = 'drop') %>%
+  pivot_wider(names_from = Has_Cabin_Info, values_from = Count, values_fill = 0)
+print(kable(cabin_stats, caption = "Cabin Information by Class"))
+
+cat("\n2. FARE DISTRIBUTION:\n")
+fare_stats <- titanic_analysis %>%
+  filter(!is.na(Fare)) %>%
+  group_by(Pclass) %>%
+  summarise(
+    Mean_Fare = mean(Fare),
+    Median_Fare = median(Fare),
+    SD_Fare = sd(Fare),
+    .groups = 'drop'
+  )
+print(kable(fare_stats, digits = 2, caption = "Fare Statistics by Class"))
+
+cat("\n3. FAMILY SIZE DISTRIBUTION:\n")
+family_stats <- titanic_analysis %>%
+  group_by(Pclass) %>%
+  summarise(
+    Mean_Family_Size = mean(Family_Size),
+    Median_Family_Size = median(Family_Size),
+    .groups = 'drop'
+  )
+print(kable(family_stats, digits = 2, caption = "Family Size by Class"))
+```
+
+**Explanation**: Before fitting models, we document the distribution of our access proxies across classes. These descriptive statistics reveal that class groups differ substantially in cabin information completeness, fare paid, and family size. These differences in turn could enable or constrain access to lifeboats and evacuation information, providing a mechanism through which class could affect survival independent of stated priority rules.
+
+### 3.2 Model Comparison: Class-Only vs. Class + Access Proxies
+
+```{r models_access_mediation}
+# Model 1: Class effect only
+model_class_only <- glm(Survived ~ Pclass, 
+                        data = titanic_analysis, 
+                        family = binomial)
+
+cat("Model 1: Class Effect Only\n")
+cat("===========================\n")
+print(summary(model_class_only))
+
+# Model 2: Class + Cabin information (location/access proxy)
+model_cabin <- glm(Survived ~ Pclass + Has_Cabin_Info, 
+                   data = titanic_analysis, 
+                   family = binomial)
+
+cat("\n\nModel 2: Class + Cabin Information\n")
+cat("====================================\n")
+print(summary(model_cabin))
+
+# Model 3: Class + Multiple access proxies
+model_access <- glm(Survived ~ Pclass + Has_Cabin_Info + Fare + Family_Size, 
+                    data = titanic_analysis %>% filter(!is.na(Fare)), 
+                    family = binomial)
+
+cat("\n\nModel 3: Class + Multiple Access Proxies\n")
+cat("=========================================\n")
+print(summary(model_access))
+
+# Compare class coefficients across models
+class_only_coef <- coef(model_class_only)
+cabin_coef <- coef(model_cabin)
+access_coef <- coef(model_access)
+
+comparison_df <- data.frame(
+  Model = c("Class Only", "Class + Cabin", "Class + Access Proxies"),
+  Pclass2 = c(
+    round(class_only_coef["Pclass2"], 4),
+    round(cabin_coef["Pclass2"], 4),
+    round(access_coef["Pclass2"], 4)
+  ),
+  Pclass3 = c(
+    round(class_only_coef["Pclass3"], 4),
+    round(cabin_coef["Pclass3"], 4),
+    round(access_coef["Pclass3"], 4)
+  )
+)
+cat("\n\nComparison of Class Coefficients Across Models:\n")
+kable(comparison_df, caption = "Class Coefficient Shrinkage (Mediation)")
+
+# Calculate mediation: how much the Pclass3 effect shrinks
+original_effect <- class_only_coef["Pclass3"]
+reduced_effect <- access_coef["Pclass3"]
+mediated_proportion <- (original_effect - reduced_effect) / original_effect
+cat("\n\nMediation Analysis for Pclass3:\n")
+cat("Original coefficient (Class-only model):", round(original_effect, 4), "\n")
+cat("Reduced coefficient (With access proxies):", round(reduced_effect, 4), "\n")
+cat("Proportion of effect mediated:", round(mediated_proportion, 3), "\n")
+cat("(Interpretation: Access proxies explain approximately", 
+    round(mediated_proportion * 100, 1), "% of the class effect on 3rd class passengers)\n")
+```
+
+**Explanation**: Model comparison reveals how much of the class effect is "explained away" (mediated) by access proxies. If mediation is substantial (say, >40%), it suggests that class-based differences in location access and boarding specificity are a major pathway to survival differences. If mediation is weak (<20%), it implies that other mechanisms—particularly priority rules—play a larger role. The shrinkage in Pclass coefficients when we add access proxies measures the strength of this mediation mechanism.
+
+### 3.3 Visualizing Access Mechanisms
+
+```{r visualize_access_patterns}
+# Visualization 1: Cabin Information Effect
+p1 <- titanic_analysis %>%
+  group_by(Has_Cabin_Info, Pclass) %>%
+  summarise(Survival_Rate = mean(Survived), N = n(), .groups = 'drop') %>%
+  ggplot(aes(x = factor(Pclass), y = Survival_Rate, fill = Has_Cabin_Info)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("#d7191c", "#2b83ba"), 
+                    labels = c("No Cabin Info", "Has Cabin Info")) +
+  theme_minimal() +
+  labs(title = "Survival Rates by Class and Cabin Information",
+       x = "Passenger Class",
+       y = "Survival Rate",
+       fill = "") +
+  theme(legend.position = "bottom")
+
+# Visualization 2: Fare Category Effect
+p2 <- titanic_analysis %>%
+  filter(!is.na(Fare)) %>%
+  group_by(Fare_Category, Pclass) %>%
+  summarise(Survival_Rate = mean(Survived), N = n(), .groups = 'drop') %>%
+  mutate(Fare_Category = factor(Fare_Category, 
+         levels = c("Zero", "Low", "Lower-Mid", "Mid", "High", "Missing"))) %>%
+  ggplot(aes(x = Fare_Category, y = Survival_Rate, fill = factor(Pclass))) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("#1b9e77", "#d95f02", "#7570b3"),
+                    labels = c("1st", "2nd", "3rd"),
+                    name = "Class") +
+  theme_minimal() +
+  labs(title = "Survival Rates by Fare Category and Class",
+       x = "Fare Category",
+       y = "Survival Rate") +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Visualization 3: Family Size Effect
+p3 <- titanic_analysis %>%
+  group_by(Family_Size, Pclass) %>%
+  summarise(Survival_Rate = mean(Survived), N = n(), .groups = 'drop') %>%
+  filter(Family_Size <= 6) %>%
+  ggplot(aes(x = Family_Size, y = Survival_Rate, color = factor(Pclass))) +
+  geom_point(size = 3, alpha = 0.7) +
+  geom_line() +
+  scale_color_manual(values = c("#1b9e77", "#d95f02", "#7570b3"),
+                     labels = c("1st", "2nd", "3rd"),
+                     name = "Class") +
+  theme_minimal() +
+  labs(title = "Survival Rates by Family Size and Class",
+       x = "Family Size",
+       y = "Survival Rate") +
+  theme(legend.position = "bottom")
+
+print(p1)
+print(p2)
+print(p3)
+```
+
+**Explanation**: These visualizations show how access proxies interact with class status. If class effects persist strongly even within fare categories or family size groups, it suggests that access is not the primary mechanism. If class gaps narrow considerably within strata defined by access proxies (e.g., within the "High" fare category), it suggests access mediation is operative. These plots allow readers to visually assess the evidence for access-based mediation.
+
+---
+
+## Part 4: Testing Policy Consistency and Social Visibility
+
+### 4.1 Survival by Sex, Age, and Title (Policy Variables)
+
+Now we examine whether stated survival rules ("women and children first") were applied consistently or varied by social visibility and group context.
+
+```{r policy_effects_basic}
+# Survival by sex and age group
+survival_by_sex_age <- titanic_analysis %>%
+  filter(!is.na(Age_Group)) %>%
+  group_by(Pclass, Sex, Age_Group) %>%
+  summarise(
+    N = n(),
+    Survival_Rate = mean(Survived),
+    .groups = 'drop'
+  ) %>%
+  arrange(Pclass, Sex)
+
+cat("Survival Rates by Class, Sex, and Age Group:\n")
+kable(survival_by_sex_age, 
+      digits = 3,
+      caption = "Sex and Age Effects on Survival by Class")
+
+# Survival by sex and title (social visibility)
+survival_by_sex_title <- titanic_analysis %>%
+  group_by(Pclass, Sex, Title_Grouped) %>%
+  summarise(
+    N = n(),
+    Survival_Rate = mean(Survived),
+    .groups = 'drop'
+  ) %>%
+  arrange(Pclass, Sex, Title_Grouped)
+
+cat("\n\nSurvival Rates by Class, Sex, and Title (Social Visibility):\n")
+kable(survival_by_sex_title, 
+      digits = 3,
+      caption = "Sex and Title Effects on Survival by Class")
+```
+
+**Explanation**: These tables examine whether the "women and children first" rule (a stated policy) operated uniformly or varied by observable characteristics. If the rule was applied consistently, we would expect similar female-male survival gaps across all age groups and title groups within each class. Variable gaps across these groups would suggest that policy implementation depended on recognizable status markers (titles) or age perception. This is crucial for assessing whether rules were absolute or contingent on social visibility.
+
+### 4.2 Sex Effects Across Social Groups
+
+```{r sex_effect_variation}
+# Calculate female-male gaps within each class, title, and family context
+cat("Female-Male Survival Gap Analysis:\n")
+cat("===================================\n\n")
+
+# By title
+cat("Sex Gap by Class and Title:\n")
+sex_gap_by_title <- titanic_analysis %>%
+  group_by(Pclass, Title_Grouped) %>%
+  summarise(
+    N = n(),
+    Female_Survival = mean(Survived[Sex == "female"]),
+    Male_Survival = mean(Survived[Sex == "male"]),
+    Sex_Gap = Female_Survival - Male_Survival,
+    .groups = 'drop'
+  ) %>%
+  filter(N >= 5) %>%  # Only show groups with at least 5 passengers
+  arrange(Pclass)
+
+kable(sex_gap_by_title, 
+      digits = 3,
+      caption = "Female Advantage in Survival by Class and Title")
+
+# By family size
+cat("\n\nSex Gap by Class and Family Size:\n")
+sex_gap_by_family <- titanic_analysis %>%
+  group_by(Pclass, Family_Size) %>%
+  summarise(
+    N = n(),
+    Female_Survival = mean(Survived[Sex == "female"]),
+    Male_Survival = mean(Survived[Sex == "male"]),
+    Sex_Gap = Female_Survival - Male_Survival,
+    .groups = 'drop'
+  ) %>%
+  filter(N >= 5, Family_Size <= 5) %>%
+  arrange(Pclass, Family_Size)
+
+kable(sex_gap_by_family, 
+      digits = 3,
+      caption = "Female Advantage in Survival by Class and Family Size")
+```
+
+**Explanation**: If the female survival advantage is consistent across all title groups and family sizes, it suggests the rule was applied uniformly (a strict policy). If gaps vary—for instance, if titled women (Officer, Nobility) had larger advantages than untitled women—it suggests policy application depended on social visibility. Variable gaps by family size would indicate that group context mattered. These stratified analyses reveal whether rules operated as absolute or context-dependent.
+
+### 4.3 Modeling Policy Effects and Interactions
+
+```{r model_policy_effects}
+# Model 4: Sex and Title effects (testing rule consistency)
+model_sex_title <- glm(Survived ~ Pclass + Sex + Title_Grouped + Sex:Title_Grouped,
+                       data = titanic_analysis, 
+                       family = binomial)
+
+cat("Model 4: Class + Sex + Title + Sex×Title Interactions\n")
+cat("(Tests whether female advantage varies by social visibility)\n")
+cat("==========================================================\n")
+print(summary(model_sex_title))
+
+# Model 5: Sex and Age effects (testing children priority)
+model_sex_age <- glm(Survived ~ Pclass + Sex + Age_Group + Family_Size,
+                     data = titanic_analysis %>% filter(!is.na(Age_Group)), 
+                     family = binomial)
+
+cat("\n\nModel 5: Class + Sex + Age Group + Family Size\n")
+cat("(Tests whether children received priority, and family context effects)\n")
+cat("=======================================================================\n")
+print(summary(model_sex_age))
+
+# Model 6: Full model with interactions
+model_full <- glm(
+  Survived ~ Pclass + Sex + Age_Group + Family_Size + 
+             Has_Cabin_Info + Fare + 
+             Sex:Age_Group + Sex:Title_Grouped,
+  data = titanic_analysis %>% filter(!is.na(Age_Group), !is.na(Fare)),
+  family = binomial
+)
+
+cat("\n\nModel 6: Full Model with Access + Policy + Interactions\n")
+cat("=========================================================\n")
+print(summary(model_full))
+```
+
+**Explanation**: These models test specific hypotheses about rule consistency. The Sex:Title_Grouped interaction terms reveal whether the female advantage depended on social visibility (represented by title). If some title groups show weaker female advantages than others, it suggests inconsistent application. The Sex:Age_Group interaction tests whether children received uniform priority or whether age-based preference depended on sex. These interaction effects provide evidence about whether rules were absolute (uniform effects) or contingent (varying effects).
+
+---
+
+## Part 5: Integrated Analysis and Model Comparison
+
+### 5.1 Comprehensive Model Comparison
+
+```{r model_comparison}
+# Collect all models and compare
+models_list <- list(
+  "Class_Only" = model_class_only,
+  "Class_Cabin" = model_cabin,
+  "Class_Access" = model_access,
+  "Sex_Title" = model_sex_title,
+  "Sex_Age" = model_sex_age,
+  "Full_Model" = model_full
+)
+
+# Create comparison table
+model_comparison <- data.frame(
+  Model = names(models_list),
+  Observations = sapply(models_list, function(m) nobs(m)),
+  AIC = sapply(models_list, AIC),
+  BIC = sapply(models_list, BIC)
+) %>%
+  mutate(
+    Delta_AIC = AIC - min(AIC),
+    Delta_BIC = BIC - min(BIC)
+  ) %>%
+  arrange(AIC)
+
+cat("Model Comparison: AIC and BIC (Lower is better)\n")
+cat("==============================================\n")
+kable(model_comparison %>% arrange(AIC), 
+      digits = 1,
+      caption = "Model Fit Comparison")
+
+cat("\n\nInterpretation:\n")
+cat("- Models with lower AIC/BIC provide better balance of fit and complexity\n")
+cat("- Delta_AIC > 10 typically indicates substantially worse fit\n")
+cat("- Model choice depends on research question: goodness-of-fit vs. mechanism clarity\n")
+```
+
+**Explanation**: Model comparison helps readers assess which mechanisms—access proxies, policy effects, or interactions—are most important for explaining Titanic survival. Lower AIC indicates better fit controlling for complexity. If access-only models fit substantially better than class-only, it suggests access was primary. If sex/age models fit better, policy effects dominate. If the full model including interactions fits best, it suggests both mechanisms and context-dependency matter. These comparisons guide readers toward evidence-based assessment of mechanism importance.
+
+### 5.2 Quantifying Mechanisms
+
+```{r mechanism_quantification}
+cat("Quantitative Summary of Mediation and Policy Effects\n")
+cat("====================================================\n\n")
+
+# Calculate pseudo-R² for comparison
+pr2_class_only <- 1 - (model_class_only$deviance / model_class_only$null.deviance)
+pr2_access <- 1 - (model_access$deviance / model_access$null.deviance)
+pr2_sex_age <- 1 - (model_sex_age$deviance / model_sex_age$null.deviance)
+pr2_full <- 1 - (model_full$deviance / model_full$null.deviance)
+
+pseudo_r2_df <- data.frame(
+  Model = c("Class Only", "Class + Access", "Sex + Age", "Full Model"),
+  Pseudo_R2 = c(pr2_class_only, pr2_access, pr2_sex_age, pr2_full),
+  Additional_Variance_Explained = c(
+    0,
+    pr2_access - pr2_class_only,
+    pr2_sex_age - pr2_class_only,
+    pr2_full - pr2_class_only
+  )
+)
+
+cat("Pseudo-R² (Proportion of Deviance Explained):\n")
+kable(pseudo_r2_df, 
+      digits = 4,
+      caption = "Variance Explained by Different Model Specifications")
+
+cat("\n\nInterpretation:\n")
+cat("- Class-only model explains baseline variance in survival\n")
+cat("- Additional variance from access proxies indicates access mediation strength\n")
+cat("- Additional variance from sex/age indicates policy effect importance\n")
+cat("- Full model combines both mechanisms and interactions\n")
+```
+
+**Explanation**: Pseudo-R² comparisons quantify how much additional variance (and thus predictive power) is gained by including access mechanisms versus policy mechanisms. Large gains from access proxies suggest access constraints are important; large gains from sex/age/title suggest policy effects dominate. Comparing these magnitudes helps readers assess the relative importance of the two research question mechanisms.
+
+---
+
+## Part 6: Summary and Interpretation Framework
+
+### 6.1 What This Analysis Enables
+
+```{r interpretation_framework}
+cat("How to Use These Results to Answer the Research Questions\n")
+cat("==========================================================\n\n")
+
+cat("RESEARCH QUESTION 1: Access Mediation\n")
+cat("How much of the class-survival gap is explained by access vs. policy?\n\n")
+cat("Evidence to examine:\n")
+cat("1. Model comparison: Class-only vs. Class+Access proxy models\n")
+cat("   → If Pclass coefficients shrink >40%, access mediation is substantial\n")
+cat("   → If shrinkage <15%, policy effects are more important\n")
+cat("2. AIC/BIC comparison: Are access proxy models substantially better?\n")
+cat("3. Coefficient interpretation: Do all access proxies have significant effects?\n\n")
+
+cat("RESEARCH QUESTION 2: Policy Consistency\n")
+cat("Were survival rules applied consistently or contextually?\n\n")
+cat("Evidence to examine:\n")
+cat("1. Sex effect variation across title groups\n")
+cat("   → Uniform sex effects → rules applied consistently\n")
+cat("   → Variable sex effects → rules depended on social visibility\n")
+cat("2. Interaction terms (Sex×Title, Sex×FamilySize)\n")
+cat("   → Significant interactions → policy application was context-dependent\n")
+cat("3. Sex gaps within family size/title strata\n")
+cat("   → Large, uniform gaps → absolute priority for women\n")
+cat("   → Variable gaps → contingent application\n")
+```
+
+**Explanation**: This framework translates statistical results into interpretations relevant to the research questions. Rather than providing final conclusions, we give readers a roadmap for evidence-based inference. By examining model fits, coefficient shrinkage, and interaction terms, readers can assess the strength of evidence for access mediation versus policy effects, and for consistent versus contingent rule application.
+
+### 6.2 Data Limitations
+
+```{r limitations}
+cat("Critical Data Limitations and Analytical Assumptions\n")
+cat("====================================================\n\n")
+
+cat("1. MISSING DATA:\n")
+missing_pct <- data.frame(
+  Variable = c("Age", "Cabin", "Embarked"),
+  Missing_Count = c(
+    sum(is.na(titanic_raw$Age)),
+    sum(is.na(titanic_raw$Cabin)),
+    sum(is.na(titanic_raw$Embarked))
+  ),
+  Missing_Pct = c(
+    round(100 * sum(is.na(titanic_raw$Age)) / nrow(titanic_raw), 1),
+    round(100 * sum(is.na(titanic_raw$Cabin)) / nrow(titanic_raw), 1),
+    round(100 * sum(is.na(titanic_raw$Embarked)) / nrow(titanic_raw), 1)
+  )
+)
+print(kable(missing_pct, caption = "Missing Data Percentages"))
+cat("\nImplication: Stratified analyses are limited by reduced sample sizes\n\n")
+
+cat("2. PROXY VALIDITY:\n")
+cat("- Cabin presence ≠ actual cabin location (observed with error)\n")
+cat("- Fare ≠ direct measure of deck assignment\n")
+cat("- Title ≠ measured social prominence (coarse indicator)\n")
+cat("Implication: Effects are attenuated; true mediation may be stronger\n\n")
+
+cat("3. OBSERVATIONAL DATA:\n")
+cat("- Models show associations, not causal effects\n")
+cat("- Unmeasured confounding is possible\n")
+cat("- Mediation effects are suggestive, not definitive\n")
+cat("Implication: Interpret as 'consistent with' rather than 'proves'\n")
+```
+
+**Explanation**: This section acknowledges limitations readers must consider. Missing data reduces sample sizes in stratified analyses. Proxies are imperfect but reasonable given available data. Most importantly, observational data cannot establish causation; we can only assess associations. Readers should interpret our findings as evidence about plausible mechanisms, subject to these limitations.
+
+### 6.3 Key Takeaways
+
+```{r key_takeaways}
+cat("Summary: What Each Analysis Component Reveals\n")
+cat("==============================================\n\n")
+
+summary_table <- data.frame(
+  "Question" = c("Q1: Access Mediation", "Q1: Access Mediation",
+                 "Q2: Rule Consistency", "Q2: Rule Consistency", "Q2: Rule Consistency"),
+  "Analytical Step" = c(
+    "Compare Class-only vs Class+Access models",
+    "Measure shrinkage in Pclass coefficients",
+    "Examine Sex effects across Title groups",
+    "Test Sex×Title interactions",
+    "Compare sex gaps across family contexts"
+  ),
+  "What It Shows" = c(
+    "Whether access proxies improve model fit",
+    "Strength of access mediation (% of effect explained)",
+    "Whether female advantage is uniform or varies",
+    "Whether policy implementation was context-dependent",
+    "Whether family size modulates rule application"
+  )
+)
+
+kable(summary_table, caption = "Analytical Components and Their Interpretation")
+
+cat("\n\nFinal Note:\n")
+cat("This report provides analysis tools, not conclusions. The evidence presented enables")
+cat(" readers to assess the plausibility of different mechanisms. Your interpretation of")
+cat(" this evidence, combined with historical context and domain knowledge, determines")
+cat(" the answers to these research questions.")
+```
+
+**Explanation**: This summary reminds readers that the report is designed to enable informed interpretation, not to provide final answers. By transparently presenting all models, coefficients, interactions, and visualizations, we allow readers to assess evidence themselves. This approach respects the complexity of historical analysis and avoids false certainty about mechanisms that operated over a century ago.
+
+---
+
+## Conclusion
+
+This report provides a comprehensive analytical framework for investigating two research questions about Titanic survival:
+
+1. **Access Mediation**: We decompose the class-survival gap by comparing models with and without access proxies (cabin information, fare, family size), measuring how much each mechanism explains.
+
+2. **Policy Consistency**: We examine whether the "women and children first" rule was applied uniformly (consistent effects across groups) or variably (context-dependent effects by title, family size, and age group).
+
+Rather than stating conclusions, we present evidence: multiple models, coefficient comparisons, interaction analyses, and visualizations. Readers can use this evidence to assess competing mechanisms and draw their own informed conclusions about why class mattered—and why survival rules, if they existed, may have been applied inconsistently—in the Titanic disaster.
+
+All analyses are reproducible, transparent, and grounded in available Titanic data. Every finding is generated from code, ensuring verifiability and allowing readers to examine the evidence directly.
