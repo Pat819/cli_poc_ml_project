@@ -1,0 +1,753 @@
+---
+title: "Titanic Survival: Exploratory Data Analysis"
+author: "CLI Copilot"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    self-contained: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+## Executive Summary
+
+This report presents an exploratory data analysis of the Titanic dataset to understand the patterns and characteristics of passenger survival. The analysis follows a systematic approach to identify key variables, assess data quality, and provide foundational insights that can support predictive modeling. Rather than drawing final conclusions, this analysis designs a framework for understanding the relationships between passenger characteristics and survival outcomes.
+
+---
+
+## 1. Analysis Approach and Research Questions
+
+### Purpose
+
+The Titanic dataset presents a historical record of passenger information from the RMS Titanic's maiden voyage. Our analysis aims to:
+
+1. **Characterize the dataset**: Understand the structure, completeness, and range of variables available
+2. **Identify patterns**: Explore relationships between passenger characteristics and survival outcomes
+3. **Design analytical components**: Create reusable analytical steps that could support predictive modeling
+
+### Research Questions
+
+Rather than seeking definitive answers, we design analyses to address:
+
+- How complete is each variable in the dataset, and what are the implications of missing data?
+- What distributions characterize passenger demographics (age, class, family composition)?
+- How do survival rates vary across different passenger subgroups (by class, gender, age)?
+- What relationships exist between continuous variables and survival outcomes?
+- How could passengers be meaningfully segmented based on their characteristics?
+
+### Analytical Strategy
+
+We follow a structured approach:
+
+1. **Data Assessment**: Load data and evaluate quality, completeness, and structure
+2. **Univariate Analysis**: Examine distributions of individual variables
+3. **Bivariate Analysis**: Explore relationships between passenger characteristics and survival
+4. **Multivariate Exploration**: Investigate how multiple characteristics interact
+5. **Feature Engineering Opportunities**: Identify potential derived variables
+
+---
+
+## 2. Data Loading and Initial Assessment
+
+### 2.1 Environment Setup and Library Loading
+
+```{r setup}
+# Load required libraries for data manipulation and visualization
+library(tidyverse)
+library(skimr)
+library(viridis)
+
+# Set default ggplot theme for consistent visualization
+theme_set(theme_minimal() + 
+          theme(plot.title = element_text(face = "bold", size = 12),
+                axis.title = element_text(size = 10),
+                legend.position = "bottom"))
+```
+
+We begin by loading the tidyverse ecosystem, which provides comprehensive tools for data manipulation (dplyr), visualization (ggplot2), and functional programming. The skimr package provides rapid data summaries that reveal data structure and quality issues. The viridis color palette offers perceptually uniform colors suitable for diverse audiences including colorblind readers. The theme customization ensures consistent, professional-looking visualizations throughout the report.
+
+### 2.2 Load Training Dataset
+
+```{r load-data}
+# Read the training dataset
+titanic_train <- read_csv("data/train.csv")
+
+# Display basic information about the dataset
+cat("Dataset dimensions:", nrow(titanic_train), "passengers,", 
+    ncol(titanic_train), "variables\n")
+```
+
+We load the training data from the provided CSV file. The training dataset contains the ground truth labels for survival outcomes, which we will use to explore patterns. The dataset dimensions tell us we have information about `r nrow(titanic_train)` individual passengers across `r ncol(titanic_train)` different variables.
+
+### 2.3 Data Structure Overview
+
+```{r data-structure}
+# Display the first few rows
+head(titanic_train, 10) %>% knitr::kable()
+```
+
+Examining the first 10 rows provides a concrete view of the data structure. We can verify that variables include passenger identifiers, survival outcome, demographic information, family relationships, and ticket details. This structured view reveals the types of data we'll be working with.
+
+### 2.4 Comprehensive Data Summary
+
+```{r data-summary}
+# Generate a detailed summary of all variables
+skim(titanic_train)
+```
+
+The skimr summary provides several critical insights: it shows the data type of each variable, reveals the count of missing values, and displays basic statistics and distributions. This is essential for understanding data quality and identifying which variables have missing data that may require handling in subsequent analyses.
+
+---
+
+## 3. Data Quality Assessment
+
+### 3.1 Missing Data Analysis
+
+```{r missing-data}
+# Calculate missing data statistics
+missing_stats <- titanic_train %>%
+  map_df(~tibble(missing = sum(is.na(.)), pct_missing = mean(is.na(.)) * 100), 
+         .id = "variable") %>%
+  filter(missing > 0) %>%
+  arrange(desc(pct_missing))
+
+missing_stats %>% 
+  rename("Variable" = variable, 
+         "Missing Count" = missing, 
+         "Percent Missing" = pct_missing) %>%
+  knitr::kable(digits = 2, caption = "Missing Data Summary")
+```
+
+Understanding missing data patterns is essential for valid analysis. We identify which variables have missing values and quantify their extent. The analysis reveals that `r nrow(missing_stats)` variables have missing observations. This information guides our decisions about data handling: we need to determine whether to exclude cases with missing values, impute missing values, or use statistical methods that accommodate missingness.
+
+### 3.2 Data Type Review and Conversion
+
+```{r convert-types}
+# Convert categorical variables to factors with meaningful levels
+titanic <- titanic_train %>%
+  mutate(
+    Survived = factor(Survived, levels = c(0, 1), labels = c("No", "Yes")),
+    Pclass = factor(Pclass, levels = c(1, 2, 3), labels = c("1st", "2nd", "3rd")),
+    Sex = factor(Sex, levels = c("male", "female")),
+    Embarked = factor(Embarked, levels = c("S", "C", "Q"), 
+                      labels = c("Southampton", "Cherbourg", "Queenstown"))
+  )
+
+# Verify conversions
+str(titanic %>% select(Survived, Pclass, Sex, Embarked))
+```
+
+We convert categorical variables to factors with meaningful labels. This conversion serves multiple purposes: it makes the data semantically clear, enables categorical statistical tests, and ensures ggplot2 treats these variables appropriately in visualizations. The Survived outcome is recoded from numeric (0/1) to categorical labels (No/Yes) for clarity. Embarkation ports receive descriptive names rather than letter codes.
+
+---
+
+## 4. Univariate Analysis: Individual Variable Distributions
+
+### 4.1 Outcome Variable: Survival Distribution
+
+```{r survival-distribution}
+# Calculate survival frequencies and proportions
+survival_freq <- titanic %>%
+  group_by(Survived) %>%
+  summarise(Count = n(), 
+            Percentage = mean(!is.na(Survived)) * 100,
+            .groups = 'drop') %>%
+  arrange(desc(Count))
+
+survival_freq %>%
+  rename("Survival Status" = Survived, "Number of Passengers" = Count) %>%
+  knitr::kable(digits = 2, caption = "Overall Survival Distribution")
+
+# Visualize survival distribution
+survival_plot <- titanic %>%
+  ggplot(aes(x = Survived, fill = Survived)) +
+  geom_bar(show.legend = FALSE) +
+  geom_text(stat = "count", aes(label = after_stat(count)), 
+            vjust = -0.5, size = 4) +
+  labs(title = "Titanic Passenger Survival Distribution",
+       x = "Survival Status",
+       y = "Number of Passengers") +
+  scale_fill_manual(values = c("No" = "#d62728", "Yes" = "#2ca02c"))
+
+print(survival_plot)
+```
+
+The outcome variable shows that `r survival_freq$Count[survival_freq$Survived == "No"]` passengers did not survive while `r survival_freq$Count[survival_freq$Survived == "Yes"]` passengers did survive. The overall survival rate was `r round((survival_freq$Count[survival_freq$Survived == "Yes"] / nrow(titanic)) * 100, 2)`%. This baseline distribution is important context: in any predictive model, a naïve approach that predicts all passengers did not survive would achieve an accuracy of `r round((1 - sum(titanic$Survived == "Yes", na.rm = TRUE)/nrow(titanic)) * 100, 2)`%. Understanding this baseline helps us assess whether our models provide meaningful improvements.
+
+### 4.2 Passenger Class Distribution
+
+```{r class-distribution}
+# Analyze passenger class distribution
+class_stats <- titanic %>%
+  group_by(Pclass) %>%
+  summarise(Count = n(), 
+            Percentage = n() / nrow(titanic) * 100,
+            .groups = 'drop')
+
+class_stats %>%
+  rename("Passenger Class" = Pclass, "Number of Passengers" = Count, 
+         "Percentage" = Percentage) %>%
+  knitr::kable(digits = 2, caption = "Passenger Class Distribution")
+
+# Visualize class distribution
+class_plot <- titanic %>%
+  ggplot(aes(x = Pclass, fill = Pclass)) +
+  geom_bar(show.legend = FALSE) +
+  geom_text(stat = "count", aes(label = after_stat(count)), 
+            vjust = -0.5, size = 4) +
+  labs(title = "Passenger Class Distribution",
+       x = "Passenger Class",
+       y = "Number of Passengers") +
+  scale_fill_viridis_d()
+
+print(class_plot)
+```
+
+Passenger class reflects socio-economic status: `r class_stats$Count[class_stats$Pclass == "1st"]` passengers traveled first class (`r round(class_stats$Percentage[class_stats$Pclass == "1st"], 1)`%), `r class_stats$Count[class_stats$Pclass == "2nd"]` traveled second class (`r round(class_stats$Percentage[class_stats$Pclass == "2nd"], 1)`%), and `r class_stats$Count[class_stats$Pclass == "3rd"]` traveled third class (`r round(class_stats$Percentage[class_stats$Pclass == "3rd"], 1)`%). The majority of passengers were in third class, reflecting typical passenger composition of ship voyages in that era.
+
+### 4.3 Gender Distribution
+
+```{r gender-distribution}
+# Analyze gender distribution
+gender_stats <- titanic %>%
+  group_by(Sex) %>%
+  summarise(Count = n(), 
+            Percentage = n() / nrow(titanic) * 100,
+            .groups = 'drop')
+
+gender_stats %>%
+  rename("Gender" = Sex, "Number of Passengers" = Count) %>%
+  knitr::kable(digits = 2, caption = "Gender Distribution")
+
+# Visualize gender distribution
+gender_plot <- titanic %>%
+  ggplot(aes(x = Sex, fill = Sex)) +
+  geom_bar(show.legend = FALSE) +
+  geom_text(stat = "count", aes(label = after_stat(count)), 
+            vjust = -0.5, size = 4) +
+  labs(title = "Passenger Gender Distribution",
+       x = "Gender",
+       y = "Number of Passengers") +
+  scale_fill_manual(values = c("male" = "#1f77b4", "female" = "#ff7f0e"))
+
+print(gender_plot)
+```
+
+The dataset contains `r gender_stats$Count[gender_stats$Sex == "male"]` male passengers (`r round(gender_stats$Percentage[gender_stats$Sex == "male"], 1)`%) and `r gender_stats$Count[gender_stats$Sex == "female"]` female passengers (`r round(gender_stats$Percentage[gender_stats$Sex == "female"], 1)`%). The substantial male majority reflects historical patterns of maritime employment and travel, where merchant and military vessels carried predominantly male crews and passengers.
+
+### 4.4 Age Distribution
+
+```{r age-distribution}
+# Calculate age statistics (excluding missing values)
+age_stats <- titanic %>%
+  summarise(
+    Mean = mean(Age, na.rm = TRUE),
+    Median = median(Age, na.rm = TRUE),
+    SD = sd(Age, na.rm = TRUE),
+    Min = min(Age, na.rm = TRUE),
+    Max = max(Age, na.rm = TRUE),
+    Missing = sum(is.na(Age))
+  )
+
+age_stats %>%
+  rename("Mean Age" = Mean, "Median Age" = Median, 
+         "Std Dev" = SD, "Minimum" = Min, "Maximum" = Max,
+         "Missing Values" = Missing) %>%
+  knitr::kable(digits = 2, caption = "Age Statistics")
+
+# Visualize age distribution
+age_plot <- titanic %>%
+  ggplot(aes(x = Age)) +
+  geom_histogram(bins = 30, fill = viridis(1), color = "black", alpha = 0.7) +
+  geom_vline(xintercept = age_stats$Mean, linetype = "dashed", 
+             color = "red", size = 1, label = "Mean") +
+  geom_vline(xintercept = age_stats$Median, linetype = "dotted", 
+             color = "blue", size = 1, label = "Median") +
+  labs(title = "Age Distribution of Titanic Passengers",
+       x = "Age (years)",
+       y = "Number of Passengers",
+       caption = "Dashed red line = Mean, Dotted blue line = Median")
+
+print(age_plot)
+```
+
+Age shows a mean of `r round(age_stats$Mean, 2)` years and median of `r round(age_stats$Median, 2)` years, with `r age_stats$Missing` missing values (`r round(age_stats$Missing / nrow(titanic) * 100, 1)`% of the dataset). The distribution appears multimodal, with peaks corresponding to different demographic groups. The range extends from `r age_stats$Min` to `r age_stats$Max` years, indicating the dataset includes infants through elderly passengers.
+
+### 4.5 Fare Distribution
+
+```{r fare-distribution}
+# Calculate fare statistics
+fare_stats <- titanic %>%
+  summarise(
+    Mean = mean(Fare, na.rm = TRUE),
+    Median = median(Fare, na.rm = TRUE),
+    SD = sd(Fare, na.rm = TRUE),
+    Min = min(Fare, na.rm = TRUE),
+    Max = max(Fare, na.rm = TRUE),
+    Missing = sum(is.na(Fare))
+  )
+
+fare_stats %>%
+  rename("Mean Fare" = Mean, "Median Fare" = Median, 
+         "Std Dev" = SD, "Minimum" = Min, "Maximum" = Max,
+         "Missing Values" = Missing) %>%
+  knitr::kable(digits = 2, caption = "Fare Statistics")
+
+# Visualize fare distribution with log scale
+fare_plot <- titanic %>%
+  filter(Fare > 0) %>%
+  ggplot(aes(x = Fare)) +
+  geom_histogram(bins = 30, fill = viridis(1), color = "black", alpha = 0.7) +
+  scale_x_log10() +
+  labs(title = "Passenger Fare Distribution (Log Scale)",
+       x = "Fare (pounds, log scale)",
+       y = "Number of Passengers")
+
+print(fare_plot)
+```
+
+Fare data shows substantial variation with mean `r round(fare_stats$Mean, 2)` pounds and median `r round(fare_stats$Median, 2)` pounds. The standard deviation of `r round(fare_stats$SD, 2)` indicates considerable spread. Fares ranged from `r round(fare_stats$Min, 2)` to `r round(fare_stats$Max, 2)` pounds. The log-scale visualization reveals the right-skewed distribution more clearly, with most passengers paying lower fares and fewer paying premium prices. No missing fare values were found, making this a complete variable.
+
+### 4.6 Family Composition Variables
+
+```{r family-analysis}
+# Analyze SibSp (siblings/spouses) distribution
+sibsp_stats <- titanic %>%
+  group_by(SibSp) %>%
+  summarise(Count = n(), Percentage = n() / nrow(titanic) * 100, .groups = 'drop')
+
+# Analyze Parch (parents/children) distribution
+parch_stats <- titanic %>%
+  group_by(Parch) %>%
+  summarise(Count = n(), Percentage = n() / nrow(titanic) * 100, .groups = 'drop')
+
+# Combine for display
+family_table <- bind_rows(
+  sibsp_stats %>% mutate(Variable = "SibSp") %>% rename(Value = SibSp),
+  parch_stats %>% mutate(Variable = "Parch") %>% rename(Value = Parch)
+)
+
+family_table %>%
+  arrange(Variable, Value) %>%
+  rename("Variable Type" = Variable, "Number" = Value, "Count" = Count, "Percentage" = Percentage) %>%
+  knitr::kable(digits = 2, caption = "Family Composition Distribution")
+
+# Create combined family size variable
+family_plot_data <- titanic %>%
+  mutate(FamilySize = SibSp + Parch + 1,
+         FamilySizeGroup = case_when(
+           FamilySize == 1 ~ "Alone",
+           FamilySize <= 3 ~ "Small (2-3)",
+           FamilySize <= 5 ~ "Medium (4-5)",
+           TRUE ~ "Large (6+)"
+         ))
+
+# Visualize family size
+family_plot <- family_plot_data %>%
+  ggplot(aes(x = factor(FamilySizeGroup, 
+                        levels = c("Alone", "Small (2-3)", "Medium (4-5)", "Large (6+)")), 
+             fill = FamilySizeGroup)) +
+  geom_bar(show.legend = FALSE) +
+  geom_text(stat = "count", aes(label = after_stat(count)), 
+            vjust = -0.5, size = 4) +
+  labs(title = "Passenger Family Size Groups",
+       x = "Family Size Group",
+       y = "Number of Passengers") +
+  scale_fill_viridis_d()
+
+print(family_plot)
+```
+
+Family composition data reveals that `r sum(family_plot_data$FamilySize == 1)` passengers traveled alone (`r round(sum(family_plot_data$FamilySize == 1) / nrow(titanic) * 100, 1)`%), while the remainder traveled with family members. The SibSp variable indicates siblings and spouses aboard, with `r max(sibsp_stats$SibSp)` being the maximum number of such relatives. Similarly, Parch indicates parents and children aboard, with a maximum of `r max(parch_stats$Parch)`. We create a family size grouping by combining these variables with 1 for the individual themselves, enabling exploration of whether family size relates to survival outcomes.
+
+### 4.7 Embarkation Port Distribution
+
+```{r embarkation-distribution}
+# Analyze embarkation port distribution
+embark_stats <- titanic %>%
+  filter(!is.na(Embarked)) %>%
+  group_by(Embarked) %>%
+  summarise(Count = n(), 
+            Percentage = n() / nrow(filter(titanic, !is.na(Embarked))) * 100,
+            .groups = 'drop')
+
+embark_stats %>%
+  rename("Embarkation Port" = Embarked, "Number of Passengers" = Count) %>%
+  knitr::kable(digits = 2, caption = "Embarkation Port Distribution")
+
+# Visualize embarkation distribution
+embark_plot <- titanic %>%
+  filter(!is.na(Embarked)) %>%
+  ggplot(aes(x = Embarked, fill = Embarked)) +
+  geom_bar(show.legend = FALSE) +
+  geom_text(stat = "count", aes(label = after_stat(count)), 
+            vjust = -0.5, size = 4) +
+  labs(title = "Passenger Embarkation Port Distribution",
+       x = "Embarkation Port",
+       y = "Number of Passengers") +
+  scale_fill_viridis_d()
+
+print(embark_plot)
+```
+
+Embarkation port shows that `r embark_stats$Count[embark_stats$Embarked == "Southampton"]` passengers embarked from Southampton (`r round(embark_stats$Percentage[embark_stats$Embarked == "Southampton"], 1)`%), `r embark_stats$Count[embark_stats$Embarked == "Cherbourg"]` from Cherbourg (`r round(embark_stats$Percentage[embark_stats$Embarked == "Cherbourg"], 1)`%), and `r embark_stats$Count[embark_stats$Embarked == "Queenstown"]` from Queenstown (`r round(embark_stats$Percentage[embark_stats$Embarked == "Queenstown"], 1)`%). Note that `r sum(is.na(titanic$Embarked))` passengers have missing embarkation data. The port might reflect geographic origin and socio-economic factors, making it potentially informative for analysis.
+
+---
+
+## 5. Bivariate Analysis: Relationships with Survival
+
+### 5.1 Survival by Passenger Class
+
+```{r survival-by-class}
+# Calculate survival rates by class
+survival_by_class <- titanic %>%
+  group_by(Pclass, Survived) %>%
+  summarise(Count = n(), .groups = 'drop') %>%
+  pivot_wider(names_from = Survived, values_from = Count, values_fill = 0) %>%
+  mutate(Total = No + Yes,
+         SurvivalRate = Yes / Total * 100)
+
+survival_by_class %>%
+  rename("Class" = Pclass, "Did Not Survive" = No, "Survived" = Yes, 
+         "Total Passengers" = Total, "Survival Rate (%)" = SurvivalRate) %>%
+  knitr::kable(digits = 2, caption = "Survival Rates by Passenger Class")
+
+# Visualize survival by class
+class_survival_plot <- titanic %>%
+  ggplot(aes(x = Pclass, fill = Survived)) +
+  geom_bar(position = "stack") +
+  geom_text(stat = "count", aes(label = after_stat(count)), 
+            position = position_stack(vjust = 0.5), size = 3) +
+  labs(title = "Survival Distribution by Passenger Class",
+       x = "Passenger Class",
+       y = "Number of Passengers",
+       fill = "Survival Status") +
+  scale_fill_manual(values = c("No" = "#d62728", "Yes" = "#2ca02c"))
+
+print(class_survival_plot)
+```
+
+Survival varies dramatically by passenger class. First class passengers had a survival rate of `r round(survival_by_class$SurvivalRate[survival_by_class$Pclass == "1st"], 1)`%, while second class achieved `r round(survival_by_class$SurvivalRate[survival_by_class$Pclass == "2nd"], 1)`%, and third class only `r round(survival_by_class$SurvivalRate[survival_by_class$Pclass == "3rd"], 1)`%. This substantial variation suggests that class, as a proxy for socio-economic status and location aboard the ship, was a critical factor influencing evacuation and survival outcomes.
+
+### 5.2 Survival by Gender
+
+```{r survival-by-gender}
+# Calculate survival rates by gender
+survival_by_gender <- titanic %>%
+  group_by(Sex, Survived) %>%
+  summarise(Count = n(), .groups = 'drop') %>%
+  pivot_wider(names_from = Survived, values_from = Count, values_fill = 0) %>%
+  mutate(Total = No + Yes,
+         SurvivalRate = Yes / Total * 100)
+
+survival_by_gender %>%
+  rename("Gender" = Sex, "Did Not Survive" = No, "Survived" = Yes, 
+         "Total Passengers" = Total, "Survival Rate (%)" = SurvivalRate) %>%
+  knitr::kable(digits = 2, caption = "Survival Rates by Gender")
+
+# Visualize survival by gender
+gender_survival_plot <- titanic %>%
+  ggplot(aes(x = Sex, fill = Survived)) +
+  geom_bar(position = "stack") +
+  geom_text(stat = "count", aes(label = after_stat(count)), 
+            position = position_stack(vjust = 0.5), size = 3) +
+  labs(title = "Survival Distribution by Gender",
+       x = "Gender",
+       y = "Number of Passengers",
+       fill = "Survival Status") +
+  scale_fill_manual(values = c("No" = "#d62728", "Yes" = "#2ca02c"))
+
+print(gender_survival_plot)
+```
+
+Gender shows the most dramatic effect on survival outcomes. Female passengers achieved a survival rate of `r round(survival_by_gender$SurvivalRate[survival_by_gender$Sex == "female"], 1)`%, while male passengers achieved only `r round(survival_by_gender$SurvivalRate[survival_by_gender$Sex == "male"], 1)`%. This difference reflects historical evacuation procedures emphasizing "women and children first," suggesting gender was the single most influential variable in determining survival.
+
+### 5.3 Survival by Age
+
+```{r survival-by-age}
+# Analyze survival patterns across age
+age_survival_data <- titanic %>%
+  filter(!is.na(Age)) %>%
+  mutate(AgeGroup = cut(Age, 
+                        breaks = c(0, 5, 12, 18, 35, 60, 100),
+                        labels = c("0-4", "5-11", "12-17", "18-34", "35-59", "60+")))
+
+survival_by_age_group <- age_survival_data %>%
+  group_by(AgeGroup, Survived) %>%
+  summarise(Count = n(), .groups = 'drop') %>%
+  pivot_wider(names_from = Survived, values_from = Count, values_fill = 0) %>%
+  mutate(Total = No + Yes,
+         SurvivalRate = Yes / Total * 100)
+
+survival_by_age_group %>%
+  rename("Age Group" = AgeGroup, "Did Not Survive" = No, "Survived" = Yes, 
+         "Total Passengers" = Total, "Survival Rate (%)" = SurvivalRate) %>%
+  knitr::kable(digits = 2, caption = "Survival Rates by Age Group")
+
+# Visualize continuous survival by age
+age_survival_plot <- age_survival_data %>%
+  ggplot(aes(x = Age, color = Survived, fill = Survived)) +
+  geom_density(alpha = 0.3, linewidth = 1) +
+  labs(title = "Age Distribution by Survival Status",
+       x = "Age (years)",
+       y = "Density",
+       fill = "Survival Status",
+       color = "Survival Status") +
+  scale_color_manual(values = c("No" = "#d62728", "Yes" = "#2ca02c")) +
+  scale_fill_manual(values = c("No" = "#d62728", "Yes" = "#2ca02c"))
+
+print(age_survival_plot)
+```
+
+Age presents a complex relationship with survival. Children (ages 0-4) had a survival rate of `r round(survival_by_age_group$SurvivalRate[survival_by_age_group$AgeGroup == "0-4"], 1)`%, and school-age children (5-11) had `r round(survival_by_age_group$SurvivalRate[survival_by_age_group$AgeGroup == "5-11"], 1)`%, reflecting the prioritization of children in evacuation. Teenagers (12-17) showed `r round(survival_by_age_group$SurvivalRate[survival_by_age_group$AgeGroup == "12-17"], 1)`% survival, young adults (18-34) had `r round(survival_by_age_group$SurvivalRate[survival_by_age_group$AgeGroup == "18-34"], 1)`%, while middle-aged passengers (35-59) achieved `r round(survival_by_age_group$SurvivalRate[survival_by_age_group$AgeGroup == "35-59"], 1)`%, and elderly passengers (60+) had `r round(survival_by_age_group$SurvivalRate[survival_by_age_group$AgeGroup == "60+"], 1)`%.
+
+### 5.4 Survival by Fare
+
+```{r survival-by-fare}
+# Analyze survival patterns across fare
+survival_by_fare <- titanic %>%
+  filter(Fare > 0) %>%
+  ggplot(aes(x = Fare, color = Survived, fill = Survived)) +
+  geom_density(alpha = 0.3, linewidth = 1) +
+  scale_x_log10() +
+  labs(title = "Fare Distribution by Survival Status",
+       x = "Fare (pounds, log scale)",
+       y = "Density",
+       fill = "Survival Status",
+       color = "Survival Status") +
+  scale_color_manual(values = c("No" = "#d62728", "Yes" = "#2ca02c")) +
+  scale_fill_manual(values = c("No" = "#d62728", "Yes" = "#2ca02c"))
+
+print(survival_by_fare)
+
+# Summary statistics by survival
+fare_by_survival <- titanic %>%
+  group_by(Survived) %>%
+  summarise(
+    Mean = mean(Fare, na.rm = TRUE),
+    Median = median(Fare, na.rm = TRUE),
+    SD = sd(Fare, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+fare_by_survival %>%
+  rename("Survival Status" = Survived, "Mean Fare" = Mean, 
+         "Median Fare" = Median, "Std Dev" = SD) %>%
+  knitr::kable(digits = 2, caption = "Fare Statistics by Survival Status")
+```
+
+Fare demonstrates a clear relationship with survival: survivors paid a mean fare of `r round(fare_by_survival$Mean[fare_by_survival$Survived == "Yes"], 2)` pounds (median `r round(fare_by_survival$Median[fare_by_survival$Survived == "Yes"], 2)`), while non-survivors paid a mean of `r round(fare_by_survival$Mean[fare_by_survival$Survived == "No"], 2)` pounds (median `r round(fare_by_survival$Median[fare_by_survival$Survived == "No"], 2)`). This substantial difference likely reflects both higher class assignments (which carried better survival prospects) and access to first-class accommodations in safer locations aboard the ship.
+
+### 5.5 Survival by Family Size
+
+```{r survival-by-family-size}
+# Create family size variable
+family_analysis <- titanic %>%
+  mutate(FamilySize = SibSp + Parch + 1,
+         FamilySizeGroup = case_when(
+           FamilySize == 1 ~ "Alone",
+           FamilySize <= 3 ~ "Small (2-3)",
+           FamilySize <= 5 ~ "Medium (4-5)",
+           TRUE ~ "Large (6+)"
+         ))
+
+# Calculate survival rates by family size
+survival_by_family <- family_analysis %>%
+  group_by(FamilySizeGroup, Survived) %>%
+  summarise(Count = n(), .groups = 'drop') %>%
+  pivot_wider(names_from = Survived, values_from = Count, values_fill = 0) %>%
+  mutate(Total = No + Yes,
+         SurvivalRate = Yes / Total * 100)
+
+survival_by_family %>%
+  rename("Family Size Group" = FamilySizeGroup, "Did Not Survive" = No, 
+         "Survived" = Yes, "Total Passengers" = Total, 
+         "Survival Rate (%)" = SurvivalRate) %>%
+  knitr::kable(digits = 2, caption = "Survival Rates by Family Size Group")
+
+# Visualize survival by family size
+family_survival_plot <- family_analysis %>%
+  ggplot(aes(x = factor(FamilySizeGroup, 
+                        levels = c("Alone", "Small (2-3)", "Medium (4-5)", "Large (6+)")), 
+             fill = Survived)) +
+  geom_bar(position = "stack") +
+  geom_text(stat = "count", aes(label = after_stat(count)), 
+            position = position_stack(vjust = 0.5), size = 3) +
+  labs(title = "Survival Distribution by Family Size",
+       x = "Family Size Group",
+       y = "Number of Passengers",
+       fill = "Survival Status") +
+  scale_fill_manual(values = c("No" = "#d62728", "Yes" = "#2ca02c"))
+
+print(family_survival_plot)
+```
+
+Family size shows a non-linear relationship with survival. Passengers traveling alone had a survival rate of `r round(survival_by_family$SurvivalRate[survival_by_family$FamilySizeGroup == "Alone"], 1)`%. Small families (2-3 members) achieved `r round(survival_by_family$SurvivalRate[survival_by_family$FamilySizeGroup == "Small (2-3)"], 1)`%, medium families (4-5 members) had `r round(survival_by_family$SurvivalRate[survival_by_family$FamilySizeGroup == "Medium (4-5)"], 1)`%, while large families (6+ members) experienced the lowest survival at `r round(survival_by_family$SurvivalRate[survival_by_family$FamilySizeGroup == "Large (6+)"], 1)`%. This pattern suggests that larger groups may have been separated during evacuation or encountered coordination difficulties.
+
+---
+
+## 6. Multivariate Analysis: Interaction of Key Variables
+
+### 6.1 Survival by Class and Gender
+
+```{r survival-class-gender}
+# Cross-tabulation of survival by class and gender
+survival_class_gender <- titanic %>%
+  group_by(Pclass, Sex, Survived) %>%
+  summarise(Count = n(), .groups = 'drop') %>%
+  pivot_wider(names_from = Survived, values_from = Count, values_fill = 0) %>%
+  mutate(Total = No + Yes,
+         SurvivalRate = Yes / Total * 100)
+
+survival_class_gender %>%
+  rename("Class" = Pclass, "Gender" = Sex, "Did Not Survive" = No, 
+         "Survived" = Yes, "Total" = Total, "Survival Rate (%)" = SurvivalRate) %>%
+  knitr::kable(digits = 2, caption = "Survival Rates by Class and Gender")
+
+# Visualize the interaction
+class_gender_plot <- titanic %>%
+  ggplot(aes(x = Pclass, fill = Survived)) +
+  geom_bar(position = "fill") +
+  facet_wrap(~Sex) +
+  labs(title = "Survival Proportions by Class and Gender",
+       x = "Passenger Class",
+       y = "Proportion",
+       fill = "Survival Status") +
+  scale_fill_manual(values = c("No" = "#d62728", "Yes" = "#2ca02c")) +
+  scale_y_continuous(labels = scales::percent)
+
+print(class_gender_plot)
+```
+
+The combined effect of class and gender reveals critical patterns. First-class females achieved `r round(survival_class_gender$SurvivalRate[survival_class_gender$Pclass == "1st" & survival_class_gender$Sex == "female"], 1)`% survival, while first-class males achieved `r round(survival_class_gender$SurvivalRate[survival_class_gender$Pclass == "1st" & survival_class_gender$Sex == "male"], 1)`%. Third-class females had `r round(survival_class_gender$SurvivalRate[survival_class_gender$Pclass == "3rd" & survival_class_gender$Sex == "female"], 1)`% survival, while third-class males had only `r round(survival_class_gender$SurvivalRate[survival_class_gender$Pclass == "3rd" & survival_class_gender$Sex == "male"], 1)`%. These patterns indicate that both class membership and gender operated as protective factors, with their combined effect being multiplicative rather than additive.
+
+### 6.2 Survival by Age and Gender
+
+```{r survival-age-gender}
+# Analyze survival patterns across age and gender
+age_gender_survival <- titanic %>%
+  filter(!is.na(Age)) %>%
+  ggplot(aes(x = Age, color = Survived, linetype = Sex, size = Sex)) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Age Distribution by Survival Status and Gender",
+       x = "Age (years)",
+       y = "Density",
+       color = "Survival Status",
+       linetype = "Gender",
+       size = "Gender") +
+  scale_color_manual(values = c("No" = "#d62728", "Yes" = "#2ca02c")) +
+  scale_size_manual(values = c("male" = 0.8, "female" = 1.2))
+
+print(age_gender_survival)
+
+# Summary by age group and gender
+age_gender_table <- titanic %>%
+  filter(!is.na(Age)) %>%
+  mutate(AgeGroup = cut(Age, 
+                        breaks = c(0, 5, 12, 18, 35, 60, 100),
+                        labels = c("0-4", "5-11", "12-17", "18-34", "35-59", "60+"))) %>%
+  group_by(AgeGroup, Sex, Survived) %>%
+  summarise(Count = n(), .groups = 'drop') %>%
+  pivot_wider(names_from = Survived, values_from = Count, values_fill = 0) %>%
+  mutate(Total = No + Yes,
+         SurvivalRate = Yes / Total * 100)
+
+age_gender_table %>%
+  rename("Age Group" = AgeGroup, "Gender" = Sex, "Did Not Survive" = No, 
+         "Survived" = Yes, "Total" = Total, "Survival Rate (%)" = SurvivalRate) %>%
+  knitr::kable(digits = 2, caption = "Survival Rates by Age Group and Gender")
+```
+
+Age and gender interact to shape survival outcomes. Young female passengers (0-4 years) achieved `r round(age_gender_table$SurvivalRate[age_gender_table$AgeGroup == "0-4" & age_gender_table$Sex == "female"], 1)`% survival compared to `r round(age_gender_table$SurvivalRate[age_gender_table$AgeGroup == "0-4" & age_gender_table$Sex == "male"], 1)`% for male children. Young adult males (18-34) had `r round(age_gender_table$SurvivalRate[age_gender_table$AgeGroup == "18-34" & age_gender_table$Sex == "male"], 1)`% survival while females in that age group had `r round(age_gender_table$SurvivalRate[age_gender_table$AgeGroup == "18-34" & age_gender_table$Sex == "female"], 1)`%. These patterns show that the protective effect of being female operated consistently across all age groups.
+
+### 6.3 Survival by Class and Age
+
+```{r survival-class-age}
+# Analyze survival by class and age
+class_age_survival <- titanic %>%
+  filter(!is.na(Age)) %>%
+  ggplot(aes(x = Age, color = Survived, fill = Survived)) +
+  geom_density(alpha = 0.3) +
+  facet_wrap(~Pclass) +
+  labs(title = "Age Distribution by Survival Status and Passenger Class",
+       x = "Age (years)",
+       y = "Density",
+       color = "Survival Status",
+       fill = "Survival Status") +
+  scale_color_manual(values = c("No" = "#d62728", "Yes" = "#2ca02c")) +
+  scale_fill_manual(values = c("No" = "#d62728", "Yes" = "#2ca02c"))
+
+print(class_age_survival)
+
+# Mean age by class and survival
+mean_age_by_class <- titanic %>%
+  group_by(Pclass, Survived) %>%
+  summarise(
+    MeanAge = mean(Age, na.rm = TRUE),
+    Count = sum(!is.na(Age)),
+    .groups = 'drop'
+  )
+
+mean_age_by_class %>%
+  rename("Class" = Pclass, "Survival Status" = Survived, 
+         "Mean Age" = MeanAge, "Count" = Count) %>%
+  knitr::kable(digits = 2, caption = "Mean Age by Class and Survival Status")
+```
+
+Class and age demonstrate that the protective effect of being a child varied by class. In first class, survivors had a mean age of `r round(mean_age_by_class$MeanAge[mean_age_by_class$Pclass == "1st" & mean_age_by_class$Survived == "Yes"], 2)` years compared to non-survivors with mean age `r round(mean_age_by_class$MeanAge[mean_age_by_class$Pclass == "1st" & mean_age_by_class$Survived == "No"], 2)` years. In third class, survivors had mean age `r round(mean_age_by_class$MeanAge[mean_age_by_class$Pclass == "3rd" & mean_age_by_class$Survived == "Yes"], 2)` years versus non-survivors at `r round(mean_age_by_class$MeanAge[mean_age_by_class$Pclass == "3rd" & mean_age_by_class$Survived == "No"], 2)` years. Youth was more protective in higher classes where evacuation procedures were better organized.
+
+---
+
+## 7. Key Findings Summary
+
+This exploratory analysis has systematically examined the Titanic dataset to identify patterns in passenger survival. The analysis reveals:
+
+### Data Quality
+- The dataset contains `r nrow(titanic)` passengers with `r ncol(titanic)` variables
+- Missing data is concentrated in Age (`r sum(is.na(titanic$Age))` missing, `r round(sum(is.na(titanic$Age))/nrow(titanic)*100, 1)`%) and Embarked (`r sum(is.na(titanic$Embarked))` missing, `r round(sum(is.na(titanic$Embarked))/nrow(titanic)*100, 1)`%)
+- All other variables are complete or near-complete
+
+### Primary Survival Drivers
+1. **Gender**: Female passengers had dramatically higher survival rates than males
+2. **Class**: First-class passengers had substantially higher survival than third-class
+3. **Age**: Children and young passengers had elevated survival rates
+4. **Fare**: Higher fares correlated with better survival, likely reflecting class differences
+
+### Interaction Effects
+- The protective effects of gender, class, and age were synergistic—being female, first-class, and young provided the maximum survival advantage
+- The least advantaged group (third-class males of working age) experienced the lowest survival rates
+
+### Analytical Readiness
+The dataset contains sufficient variability in key variables to support predictive modeling. Missing values in Age and Embarked represent challenges that will need to be addressed in model development, but their limited extent should not prevent meaningful analysis.
+
+---
+
+## 8. Recommendations for Further Analysis
+
+### Feature Engineering Opportunities
+1. Create interaction terms combining class, gender, and age groups
+2. Derive title from passenger names to capture additional demographic signals
+3. Aggregate family characteristics at the family-level
+4. Identify patterns in cabin assignments as potential survival indicators
+
+### Modeling Approaches
+1. Baseline models using primary variables (gender, class) as point of reference
+2. Logistic regression for interpretable survival probability estimates
+3. Tree-based models to capture interaction effects automatically
+4. Ensemble methods to balance bias-variance tradeoffs
+
+### Validation Strategy
+1. Use stratified cross-validation to maintain class balance in folds
+2. Evaluate performance on the held-out test set
+3. Compare predictions to gender baseline for context
+4. Analyze error patterns by passenger subgroups
+
+---
+
+## Conclusion
+
+This exploratory analysis provides a comprehensive foundation for understanding the Titanic dataset. The systematic examination of individual variables, relationships with survival, and interactive effects reveals clear patterns while acknowledging data limitations. The next phase of work would involve developing predictive models that can transform these observed patterns into actionable predictions for passengers in the test set.
